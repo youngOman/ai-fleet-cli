@@ -16,4 +16,4 @@
 
 › [Pasted Content 4321 chars]
 
-  gpt-5.6-sol high · ~/w/demo
+  gpt-5.6-example high · ~/w/demo

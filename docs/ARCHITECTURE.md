@@ -110,7 +110,11 @@ composer=❯[[:space:]]+[^[:space:]]
 
 `composer` 是「使用者正在打字」的偵測規則:composer 行後面有非空白字元就代表
 他打到一半,這時**絕對不能注入通知**。沒定義時退回泛用規則 `❯[[:space:]]+[^[:space:]]`。
-`ctx` 留空(如 `adapters/cx.conf`)代表這種 CLI 沒有 context 百分比,看板顯示 `-`。
+`ctx` 留空（如 `adapters/cx.conf`）代表這種 CLI 沒有 context 百分比，看板顯示 `-`。
+
+選用的 `composer_ignore` 是**輸入框灰字提示的白名單**：空輸入框裡的提示文字
+（codex 會顯示 `Summarize recent commits` 這類）會讓 `composer` 誤判成「使用者在打字」，
+於是通知永遠送不出去。composer 行全部命中 `composer_ignore` 就視為輸入框是空的。
 
 另有選用的**自動應答**欄位（`N` 為 1–9，可定義多組）：
 

@@ -37,12 +37,26 @@ tui_ready() {
 # composer_busy_content <內容> [kind]
 # 使用者正在打字就回 0(真)。kind 給空字串時用泛用規則。
 composer_busy_content() {
-  local content=$1 kind=${2:-} re=''
+  local content=$1 kind=${2:-} re='' ign='' hits
   if [ -n "$kind" ]; then
     re=$(signals_get "$kind" composer 2>/dev/null || true)
+    ign=$(signals_get "$kind" composer_ignore 2>/dev/null || true)
   fi
-  [ -n "$re" ] || re='❯[[:space:]]+[^[:space:]]'
-  printf '%s' "$content" | LC_ALL=C grep -qE "$re|Press up to edit queued"
+  # 泛用規則要同時涵蓋兩種提示符:claude 是 ❯,codex 是 ›(U+203A)。
+  [ -n "$re" ] || re='❯[[:space:]]+[^[:space:]]|›[[:space:]]+[^[:space:]]'
+
+  # 有排隊訊息一律不插隊
+  printf '%s' "$content" | LC_ALL=C grep -qE 'Press up to edit queued' && return 0
+
+  hits=$(printf '%s' "$content" | LC_ALL=C grep -E "$re")
+  [ -n "$hits" ] || return 1
+
+  # composer_ignore:輸入框裡的灰字提示不是使用者打的字。
+  # 全部命中白名單就代表輸入框其實是空的。
+  if [ -n "$ign" ]; then
+    hits=$(printf '%s' "$hits" | LC_ALL=C grep -vE "$ign")
+  fi
+  [ -n "$hits" ]
 }
 
 # ---------------------------------------------------------------------------

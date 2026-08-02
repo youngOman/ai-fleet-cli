@@ -24,7 +24,12 @@ STATE_PATH = os.path.join(REPO_ROOT, "libexec", "fleet-state")
 
 
 def _load_fleet_state():
-    """把沒有 .py 副檔名的 libexec/fleet-state 當成模組載入。"""
+    """把沒有 .py 副檔名的 libexec/fleet-state 當成模組載入。
+
+    先關掉 bytecode 快取:不關的話每跑一次測試就在 libexec/ 底下生一個
+    __pycache__,雖然有進 .gitignore,但在別人的工作目錄裡長出東西就是不禮貌。
+    """
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_loader(
         "fleet_state",
         importlib.machinery.SourceFileLoader("fleet_state", STATE_PATH),
@@ -335,6 +340,36 @@ class TestUtf8KeyCollision(ReportDirCase):
         self.write_report(self.NAME_B, body="登出那份", mtime=NOW + 50)
         todo = self.plan(state, now=NOW + 60)
         self.assertEqual(self.names(todo), [self.NAME_B])
+
+    def test_兩份都通知過之後不會再重複通知(self):
+        # 這條是 key 碰撞最直接的照妖鏡:兩份報告共用一個 entry 的話,
+        # 那個 entry 的 hash 只會是「最後被記錄的那一份」。
+        # 於是每一輪掃描都會有一份對不上 hash → 每 3 秒重播一次通知,
+        # 兩份報告輪流洗版指揮官,而且永遠停不下來。
+        pa = self.write_report(self.NAME_A, body="登入那份", mtime=NOW - 10)
+        pb = self.write_report(self.NAME_B, body="登出那份", mtime=NOW - 9)
+        state = fs.empty_state()
+        self.plan(state)
+        fs.record_report(state, pa, "ok", NOW, MAX_ATTEMPTS)
+        fs.record_report(state, pb, "ok", NOW, MAX_ATTEMPTS)
+
+        for i in range(5):
+            self.assertEqual(
+                self.plan(state, now=NOW + 10 * (i + 1)), [],
+                "第 %d 輪:兩份都通知過了,不該再吐出任何一份" % i)
+
+    def test_一份報告的失敗次數不可算到另一份頭上(self):
+        # key 碰撞時熔斷計數會共用:A 送三次失敗把計數打滿,
+        # 剛好同一秒落地的 B 一次都還沒送就被熔斷,永遠靜音。
+        pa = self.write_report(self.NAME_A, body="登入那份", mtime=NOW - 10)
+        self.write_report(self.NAME_B, body="登出那份", mtime=NOW - 10)
+        state = fs.empty_state()
+        for _ in range(MAX_ATTEMPTS):
+            self.plan(state)
+            fs.record_report(state, pa, "fail", NOW, MAX_ATTEMPTS)
+        todo = self.names(self.plan(state))
+        self.assertIn(self.NAME_B, todo, "B 一次都還沒送就被 A 的失敗次數熔斷了")
+        self.assertNotIn(self.NAME_A, todo, "A 自己該熔斷")
 
     def test_state_檔以_UTF8_原文存_key_不轉碼(self):
         pa = self.write_report(self.NAME_A, body="登入那份", mtime=NOW - 10)

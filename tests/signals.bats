@@ -10,6 +10,7 @@
 setup() {
   load helpers
   fleet_test_signals
+  fleet_test_tmuxio   # composer_busy_content 住在 tmuxio.sh
 }
 
 # ---------------------------------------------------------------------------
@@ -33,7 +34,7 @@ assert_signals() {
   got=n; pane_asking "$kind" "$content" && got=Y
   assert_eq "$got" "$want_asking" "$f:asking 判定錯誤"
 
-  got=n; pane_composer_busy "$kind" "$content" && got=Y
+  got=n; composer_busy_content "$content" "$kind" && got=Y
   assert_eq "$got" "$want_composer" "$f:composer 判定錯誤"
 }
 
@@ -93,7 +94,9 @@ really_stuck() {
 }
 
 @test "cx-stuck-pasted:長訊息卡在輸入框 → 不忙 + 卡住訊號 = 真卡住" {
-  assert_signals cx-stuck-pasted.txt n Y n n
+  # composer 是 Y:輸入框裡真的有東西(卡住的貼上內容)。
+  # 這時注入通知會直接接在那坨內容後面,所以「不可插隊」是對的判斷。
+  assert_signals cx-stuck-pasted.txt n Y n Y
 
   local content
   content=$(fixture cx-stuck-pasted.txt)

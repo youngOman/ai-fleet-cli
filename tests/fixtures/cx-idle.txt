@@ -25,4 +25,4 @@
 
 › Summarize recent commits
 
-  gpt-5.6-luna medium · ~/w/demo · Goal achieved (14m)
+  gpt-5.6-example medium · ~/w/demo · Goal achieved (14m)

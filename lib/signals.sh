@@ -44,6 +44,11 @@ signals_load() {
 # signals_get <kind> <key> — 取不到就回空字串
 signals_get() {
   local kind=$1 key=$2
+  # kind 有驗字元集而 key 沒有是不對稱的:key 帶非識別字元(例如中文)
+  # 會讓下面那行 eval 直接噴 bash 語法錯。
+  case "$key" in
+    '' | *[!a-z0-9_]*) return 1 ;;
+  esac
   signals_load "$kind" || return 1
   eval "printf '%s' \"\${_ADP_${kind}_${key}:-}\""
 }
@@ -70,15 +75,10 @@ pane_asking() { signals_match "$1" asking "$2"; }
 pane_ready()  { signals_match "$1" ready "$2"; }
 pane_trust()  { signals_match "$1" trust "$2"; }
 
-# 使用者正在打字?composer 行(❯ 開頭)後面有非空白字元就是。
-# **使用者打字時絕對不能注入。** 實案:通知直接插進使用者打到一半的句子,
-# 把「共享」洗成「共」+通知+「享」,使用者根本沒辦法跟指揮官講話。
-pane_composer_busy() {
-  local kind=$1 content=$2 re
-  re=$(signals_get "$kind" composer)
-  [ -n "$re" ] || re='❯[[:space:]]+[^[:space:]]'
-  printf '%s' "$content" | LC_ALL=C grep -qE "$re|Press up to edit queued"
-}
+# 「使用者正在打字」的判定**不在這裡**,在 lib/tmuxio.sh 的 composer_busy_content。
+# 這個檔曾經有一份 pane_composer_busy 的複製品,而且因為漏了 composer_ignore
+# 與 codex 的 › 提示符,兩份行為並不一致——正是這個專案要避免的 regex 分身。
+# 需要判定就 source tmuxio.sh。
 
 # 從畫面內容判斷是哪一種 CLI。全部 adapter 都比一輪,第一個中的就算。
 # 回傳 kind;都不中就回空字串並 return 1。

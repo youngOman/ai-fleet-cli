@@ -55,11 +55,33 @@ reg_add() { _reg_write_locked _reg_add_raw "$1" "$2" "$3" "$4"; }
 # 驗證
 # ---------------------------------------------------------------------------
 
-valid_id()     { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
-valid_socket() { [ "$1" = "-" ] || printf '%s' "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
+# **不要用 grep 做這種驗證。** grep 是逐行比對的:`printf '%s' "%1
+# %2" | grep -qE '^%[0-9]+$'` 會因為第一行符合而回 0,含換行的值就這樣通過驗證,
+# 接著被 `printf '%s\t...\n'` 寫成 registry 的兩列,第二列是半截資料,
+# `reg_ids` 又會把它當成真的 worker id ——幽靈 worker 就是這樣長出來的。
+# 用 case 做整串比對(順帶省掉每次驗證 fork 一個 grep)。
+
+valid_id() {
+  case "$1" in
+    '' | *[!A-Za-z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+valid_socket() {
+  [ "$1" = "-" ] && return 0
+  valid_id "$1"
+}
 
 # 只收 %NN。這是刻意的嚴格——見檔頭說明。
-valid_pane()   { printf '%s' "$1" | grep -qE '^%[0-9]+$'; }
+valid_pane() {
+  local n=${1#%}
+  [ "$n" != "$1" ] || return 1      # 沒有開頭的 %
+  case "$n" in
+    '' | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
 # 對某個 worker 執行 tmux(自動帶對的 -L socket)

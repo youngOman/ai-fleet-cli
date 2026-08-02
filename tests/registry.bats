@@ -166,29 +166,17 @@ setup() {
 }
 
 @test "valid_pane 拒絕含換行的值(避免多行注入 registry)" {
-  # 【已知缺陷,尚未修,先 skip 不讓它擋住 CI】
-  # valid_pane / valid_id / valid_socket 都是 `grep -qE '^...$'`,
-  # 而 grep 是**逐行**比對:只要有任何一行符合就回 0。
-  # 所以含換行的值會通過驗證,接著被 _reg_add_raw 的
-  # `printf '%s\t%s\t%s\t%s\n'` 寫成兩列 —— registry 的第二列是半截資料,
+  # 回歸測試。原本三個驗證函式都是 `grep -qE '^...$'`,而 grep 是**逐行**比對:
+  # 只要有任何一行符合就回 0。含換行的值因此通過驗證,接著被 _reg_add_raw 的
+  # `printf '%s\t%s\t%s\t%s\n'` 寫成兩列 —— registry 第二列是半截資料,
   # reg_ids 會把它當成一個真的 worker id 列出來(幽靈 worker 又回來了)。
-  #
-  # 修法(bash 3.2 相容,不用 grep):
-  #   valid_pane() {
-  #     local v=${1#%}
-  #     [ "$v" != "$1" ] || return 1
-  #     case "$v" in '' | *[!0-9]*) return 1 ;; esac
-  #   }
-  # valid_id / valid_socket 同理改成 case 比對。
-  skip "已知缺陷:三個驗證函式都用 grep 逐行比對,含換行的值會被接受"
+  # 已改成 case 整串比對。
 
   run valid_pane "$(printf '%%1\n%%2')"
   assert_rc 1 "$status"
 }
 
 @test "valid_id / valid_socket 拒絕含換行的值" {
-  skip "已知缺陷:同上,grep 逐行比對"
-
   run valid_id "$(printf 'cc1\n壞東西')"
   assert_rc 1 "$status"
   run valid_socket "$(printf 'agents\n../evil')"
