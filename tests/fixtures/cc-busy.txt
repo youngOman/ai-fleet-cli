@@ -1,0 +1,32 @@
+# 來源:真實錄製(claude code worker,正在跑工具)。內容行已全部改寫成中性佔位字串。
+#
+# 註解區刻意不寫任何訊號字串原文——註解也會被餵給 grep,寫了就變成畫面的一部分,
+# fixture 會靠自己的註解「自證」。tests/signals.bats 有一條專門驗證註解區是惰性的。
+#
+# 這一版的 claude CLI 畫面上沒有中斷提示,忙碌只能從 spinner 行的
+# 「經過時間 + 下載 token 數」這個結構讀出來——這正是 adapters/cc.conf 的 busy
+# 要收計時器與箭頭計數兩種樣式的原因。
+
+⏺ 先確認上游有沒有問題,再往下查。
+
+  Ran 1 shell command
+
+⏺ 上游正常,所以根因在中間層。繼續往下拆。
+
+  Ran 2 shell commands
+
+⏺ 我前面的推論錯了,實際的實作不在那個檔案裡。直接看真正的進入點。
+
+  Ran 1 shell command
+
+⏺ Running 1 shell command…
+  ⎿  $ 佔位命令一
+     佔位命令二
+
+✶ Enchanting… (7m 51s · ↓ 25.8k tokens)
+                                                          ✘ Auto-update failed · Run claude doctor
+──────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────
+   ✱ Opus 5 (1M context)  ~/w/demo  ⎇ feat/example ✓  § $0.42 (1.2M tokens)  ◆ 12  ◔ 71%
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

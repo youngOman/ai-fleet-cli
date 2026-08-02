@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# fleet-watcher — 回報閉環守護行程
+#
+# worker 完工 → 寫報告到 $FLEET_REPORTS/<時間>-<worker>-<主題>.md
+#                    ↓  檔案靜置 STABLE_SECS 秒才算落地(避免半寫入就通知)
+#            watcher(每 POLL_SECS 秒掃一次)
+#                    ↓  tmux send-keys 注入指揮官輸入框 + 回讀驗證
+#            指揮官被叫醒
+#
+# **不要求 worker 自己回報。** 他們會忘,codex 會卡在輸入框。
+# 改盯「報告檔落地」這個客觀事實。這是整套設計的核心決策,不要改。
+#
+# 所有「要不要通知」的判斷都在 libexec/fleet-state(python,可測),
+# 這裡只負責 tmux I/O 與排程。
+
+# 刻意不用 -e:守護行程不能因為一次 grep 沒中就整個退場。
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# 載入 lib
+# ---------------------------------------------------------------------------
+if [ -z "${FLEET_LIBDIR:-}" ]; then
+  _self_dir=$(cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd)
+  FLEET_LIBDIR=$(cd -P "$_self_dir/.." >/dev/null 2>&1 && pwd)
+fi
+# shellcheck source=lib/core.sh
+. "$FLEET_LIBDIR/lib/core.sh"
+if [ -z "${FLEET_PROFILE_DIR:-}" ]; then
+  fleet_load_config
+  fleet_init_paths
+fi
+# shellcheck source=lib/registry.sh
+. "$FLEET_LIBDIR/lib/registry.sh"
+# shellcheck source=lib/signals.sh
+. "$FLEET_LIBDIR/lib/signals.sh"
+# shellcheck source=lib/tmuxio.sh
+. "$FLEET_LIBDIR/lib/tmuxio.sh"
+
+STATE_BIN="$FLEET_LIBDIR/libexec/fleet-state"
+LINT_BIN="$FLEET_LIBDIR/libexec/fleet-lint"
+SELF="$FLEET_LIBDIR/libexec/fleet-watcher"
+
+# ---------------------------------------------------------------------------
+# 通知指揮官
+# ---------------------------------------------------------------------------
+# 回傳碼沿用 send_verified:0 送達 / 1 驗不到 / 2 使用者在打字 / 3 TUI 沒起來
+notify_commander() {
+  local msg=$1 tag=$2 sock pane
+  sock=$(commander_socket) || return 3
+  pane=$(commander_pane) || return 3
+  [ -n "$pane" ] || return 3
+  # 一律帶 socket。舊版這條路徑用裸 tmux,指揮官若不在預設 socket 就全部靜默失敗。
+  send_verified "$sock" "$pane" "$msg" "$tag" ""
+}
+
+rc_to_result() {
+  case "$1" in
+    0) printf 'ok' ;;
+    1) printf 'fail' ;;
+    *) printf 'skip' ;;   # 2/3 = 不記帳,下輪再試
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# 報告落地
+# ---------------------------------------------------------------------------
+check_reports() {
+  local ids now line path tag worker topic msg rc result lintnote
+
+  ids=$(reg_ids | tr '\n' ' ')
+  now=$(fleet_now)
+
+  # plan-reports 同時會就地寫入 backfill 基準線,所以即使沒有待通知項目也要跑
+  "$STATE_BIN" plan-reports \
+    --state "$FLEET_STATE_FILE" \
+    --dir "$FLEET_REPORTS" \
+    --now "$now" \
+    --stable "$FLEET_STABLE_SECS" \
+    --backfill "$FLEET_BACKFILL_SECS" \
+    --max-attempts "$FLEET_MAX_ATTEMPTS" \
+    --ids "$ids" 2>/dev/null > "$FLEET_PROFILE_DIR/.plan.$$"
+
+  while IFS=$'\t' read -r path tag worker topic; do
+    [ -n "$path" ] || continue
+
+    lintnote=""
+    if [ "${FLEET_LINT_REPORTS:-1}" = "1" ] && [ -x "$LINT_BIN" ]; then
+      "$LINT_BIN" "$path" >/dev/null 2>&1 || lintnote="(四節不齊,驗收時注意) "
+    fi
+
+    msg="📥 ${worker} 已交報告 ${tag}:${topic} ${lintnote}— 請驗收 ${path}"
+    notify_commander "$msg" "$tag"
+    rc=$?
+    result=$(rc_to_result "$rc")
+
+    "$STATE_BIN" record-report --state "$FLEET_STATE_FILE" \
+      --path "$path" --result "$result" --now "$now" \
+      --max-attempts "$FLEET_MAX_ATTEMPTS" 2>/dev/null
+
+    if [ "$result" = ok ]; then
+      [ "$worker" != "-" ] && "$STATE_BIN" record-worker --state "$FLEET_STATE_FILE" \
+        --id "$worker" --event report --now "$now" 2>/dev/null
+      fleet_log info report-notified "worker=$worker" "tag=$tag" "path=$path"
+    elif [ "$result" = fail ]; then
+      fleet_log warn report-notify-unverified "worker=$worker" "tag=$tag" "path=$path"
+    else
+      fleet_log debug report-notify-deferred "worker=$worker" "tag=$tag" "rc=$rc"
+    fi
+  done < "$FLEET_PROFILE_DIR/.plan.$$"
+
+  rm -f "$FLEET_PROFILE_DIR/.plan.$$"
+}
+
+# ---------------------------------------------------------------------------
+# worker 巡邏
+# ---------------------------------------------------------------------------
+patrol_workers() {
+  local id kind sock pane screen now busy stuck action rc result tag msg
+  local ar_match ar_keys handled
+
+  now=$(fleet_now)
+  for id in $(reg_ids); do
+    kind=$(wkind "$id")
+    sock=$(wsocket "$id")
+    pane=$(wpane "$id")
+    [ -n "$pane" ] || continue
+    pane_exists "$sock" "$pane" || continue
+
+    screen=$(pane_capture "$sock" "$pane" 60)
+    [ -n "$screen" ] || continue
+
+    # 自動應答:攔截框(如 codex 的「降級到快模型」)自動選定值。
+    # 這輪處理過就不再做狀態判定——畫面正要變。
+    handled=0
+    while IFS=$'\t' read -r ar_match ar_keys; do
+      [ -n "$ar_match" ] || continue
+      if printf '%s' "$screen" | LC_ALL=C grep -qE "$ar_match"; then
+        stmux "$sock" send-keys -t "$pane" -l -- "$ar_keys" 2>/dev/null
+        sleep 0.3
+        stmux "$sock" send-keys -t "$pane" Enter 2>/dev/null
+        fleet_log info autoreply "worker=$id" "keys=$ar_keys"
+        handled=1
+        break
+      fi
+    done <<EOF
+$(signals_autoreplies "$kind")
+EOF
+    [ "$handled" = 1 ] && continue
+
+    busy=0; stuck=0
+    pane_busy  "$kind" "$screen" && busy=1
+    pane_stuck "$kind" "$screen" && stuck=1
+
+    while IFS= read -r action; do
+      [ -n "$action" ] || continue
+      case "$action" in
+        notify-stuck)
+          tag="s$now"
+          msg="🚧 ${id} 疑似卡住 ${tag}:畫面有排隊訊息但沒在跑 — fleet peek ${id}"
+          ;;
+        notify-idle)
+          tag="i$now"
+          msg="⚠️ ${id} 已閒置但沒交報告 ${tag} — fleet peek ${id}"
+          ;;
+        *) continue ;;
+      esac
+
+      notify_commander "$msg" "$tag"
+      rc=$?
+      result=$(rc_to_result "$rc")
+      if [ "$result" = ok ]; then
+        case "$action" in
+          notify-stuck) "$STATE_BIN" record-worker --state "$FLEET_STATE_FILE" --id "$id" --event stuck-notified --now "$now" 2>/dev/null ;;
+          notify-idle)  "$STATE_BIN" record-worker --state "$FLEET_STATE_FILE" --id "$id" --event idle-notified  --now "$now" 2>/dev/null ;;
+        esac
+        fleet_log info "${action}" "worker=$id" "tag=$tag"
+      else
+        fleet_log debug "${action}-deferred" "worker=$id" "rc=$rc"
+      fi
+    done <<EOF
+$("$STATE_BIN" worker-tick --state "$FLEET_STATE_FILE" --id "$id" \
+    --busy "$busy" --stuck "$stuck" --now "$now" \
+    --idle-secs "$FLEET_IDLE_SECS" --stuck-secs "$FLEET_STUCK_SECS" \
+    --quiet-after "$FLEET_QUIET_AFTER_REPORT" 2>/dev/null)
+EOF
+  done
+}
+
+# ---------------------------------------------------------------------------
+# daemon
+# ---------------------------------------------------------------------------
+cmd_daemon() {
+  fleet_ensure_dirs
+  mkdir -p "$FLEET_REPORTS" 2>/dev/null || true
+  printf '%s\n' "$$" > "$FLEET_PIDFILE"
+  trap 'if [ "$(cat "$FLEET_PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$FLEET_PIDFILE"; fi; exit 0' INT TERM
+  fleet_log info watcher-start "pid=$$" "profile=$FLEET_PROFILE" "reports=$FLEET_REPORTS"
+
+  while :; do
+    # 所有權自檢:pid 檔不是自己就退場。
+    # 這讓 `fleet watch start` 有「換班」語意——新的一起來,舊的自己走,
+    # 保證同時只有一隻在送通知(兩隻會把每則通知送兩遍)。
+    [ "$(cat "$FLEET_PIDFILE" 2>/dev/null)" = "$$" ] || break
+    check_reports
+    patrol_workers
+    sleep "$FLEET_POLL_SECS"
+  done
+
+  fleet_log info watcher-stop "pid=$$"
+}
+
+watcher_pid() { cat "$FLEET_PIDFILE" 2>/dev/null; }
+
+# 不要只用 `kill -0`:
+#   - pid 若被別的使用者的行程回收,kill -0 會回 EPERM(非零)→ 活的說成死的
+#   - 反過來,pid 被自己別的程式回收時 kill -0 會成功 → 死的說成活的
+# 所以要真的看那個 pid 是不是我們的 watcher。
+watcher_alive() {
+  local p cmd
+  p=$(watcher_pid)
+  [ -n "$p" ] || return 1
+  cmd=$(ps -p "$p" -o command= 2>/dev/null) || return 1
+  case "$cmd" in
+    *fleet-watcher*) return 0 ;;
+    *watch-launch*) return 0 ;;
+  esac
+  return 1
+}
+
+cmd_start() {
+  fleet_ensure_dirs
+  if watcher_alive; then
+    fleet_info "watcher 已在跑(pid $(watcher_pid))。要換成新版程式碼請用 fleet watch restart。"
+    return 0
+  fi
+
+  # 用啟動器腳本而不是把環境變數塞進命令字串:
+  # tmux run-shell 繼承的是 **tmux server 的環境**,不是你現在這個 shell 的。
+  # 舊版因此要在 watcher 開頭硬塞 Homebrew 路徑進 PATH——那只在一種機器上對。
+  local launcher="$FLEET_PROFILE_DIR/watch-launch.sh"
+  local v val
+  {
+    printf '#!/bin/sh\n'
+    printf '# 由 fleet watch start 產生,可直接執行來排查 watcher 起不來的原因\n'
+    printf 'PATH=%s; export PATH\n' "$(fleet_shq "$PATH")"
+    for v in FLEET_HOME FLEET_PROFILE FLEET_REPORTS FLEET_TASKS FLEET_LIBDIR \
+             FLEET_SOCKET FLEET_SESSION \
+             FLEET_SEND_DELAY FLEET_POLL_SECS FLEET_STABLE_SECS FLEET_IDLE_SECS \
+             FLEET_STUCK_SECS FLEET_QUIET_AFTER_REPORT FLEET_BACKFILL_SECS \
+             FLEET_MAX_ATTEMPTS FLEET_LINT_REPORTS; do
+      eval "[ -n \"\${$v+x}\" ]" || continue
+      eval "val=\$$v"
+      printf '%s=%s; export %s\n' "$v" "$(fleet_shq "$val")" "$v"
+    done
+    printf 'exec %s _daemon\n' "$(fleet_shq "$SELF")"
+  } > "$launcher"
+  chmod +x "$launcher"
+
+  if tmux has-session 2>/dev/null; then
+    # 掛在 tmux server 底下,不會隨這個 shell 一起死
+    tmux run-shell -b "$launcher" 2>/dev/null
+  else
+    nohup "$launcher" >/dev/null 2>&1 &
+  fi
+
+  sleep 1.5
+  if watcher_alive; then
+    fleet_info "watcher 已啟動(pid $(watcher_pid),profile=$FLEET_PROFILE)"
+  else
+    fleet_err "watcher 沒起來。手動看看:$launcher"
+    return 1
+  fi
+}
+
+cmd_stop() {
+  if ! watcher_alive; then
+    fleet_info "watcher 沒在跑。"
+    rm -f "$FLEET_PIDFILE"
+    return 0
+  fi
+  local p i=0
+  p=$(watcher_pid)
+  kill "$p" 2>/dev/null
+  while [ "$i" -lt 20 ] && kill -0 "$p" 2>/dev/null; do
+    sleep 0.2
+    i=$((i + 1))
+  done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+  # 只在 pid 檔仍是自己那隻時才刪:亂刪會把剛接班的新 watcher 也弄退場
+  [ "$(watcher_pid)" = "$p" ] && rm -f "$FLEET_PIDFILE"
+  fleet_info "watcher 已停(pid $p)"
+}
+
+cmd_restart() { cmd_stop; sleep 0.3; cmd_start; }
+
+cmd_status() {
+  local n
+  if watcher_alive; then
+    printf '%s● watcher 運作中%s  pid=%s  profile=%s\n' "$c_grn" "$c_rst" "$(watcher_pid)" "$FLEET_PROFILE"
+  else
+    printf '%s○ watcher 未執行%s  profile=%s(fleet watch start 啟動)\n' "$c_dim" "$c_rst" "$FLEET_PROFILE"
+  fi
+  n=$(ls -1 "$FLEET_REPORTS"/*.md 2>/dev/null | wc -l | tr -d ' ')
+  printf '  報告目錄  %s(%s 份)\n' "$FLEET_REPORTS" "$n"
+  if [ -f "$FLEET_COMMANDER_FILE" ]; then
+    printf '  指揮官    socket=%s pane=%s\n' "$(commander_socket)" "$(commander_pane)"
+  else
+    printf '  指揮官    %s未設定%s — 在指揮官那個 pane 跑 tmux display -p "#{pane_id}",再 fleet commander <pane>\n' "$c_ylw" "$c_rst"
+  fi
+  printf '  門檻      輪詢=%ss 靜置=%ss 閒置=%ss 卡住=%ss 熔斷=%s 次\n' \
+    "$FLEET_POLL_SECS" "$FLEET_STABLE_SECS" "$FLEET_IDLE_SECS" "$FLEET_STUCK_SECS" "$FLEET_MAX_ATTEMPTS"
+  printf '  狀態檔    %s\n' "$FLEET_STATE_FILE"
+  printf '  日誌      %s\n' "$FLEET_LOG"
+}
+
+cmd_log() {
+  local n=${1:-40}
+  [ -f "$FLEET_LOG" ] || { fleet_info "還沒有日誌:$FLEET_LOG"; return 0; }
+  # 日誌是 JSON Lines。有 python3 就攤平成人看得懂的一行,沒有就原樣 tail。
+  if command -v python3 >/dev/null 2>&1; then
+    tail -n "$n" "$FLEET_LOG" | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except ValueError:
+        print(line)
+        continue
+    head = "%s %-5s %s" % (d.pop("ts", "-"), d.pop("level", "-"), d.pop("event", "-"))
+    rest = " ".join("%s=%s" % (k, v) for k, v in sorted(d.items()))
+    print(head + ("  " + rest if rest else ""))
+'
+  else
+    tail -n "$n" "$FLEET_LOG"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+fleet watch — 回報閉環守護行程
+
+  fleet watch start      啟動(已在跑則不重複啟動)
+  fleet watch stop       停止
+  fleet watch restart    換班:停掉舊的、用目前的程式碼起一隻新的
+  fleet watch status     看狀態與生效中的門檻
+  fleet watch log [N]    看最近 N 行日誌(預設 40)
+EOF
+}
+
+main() {
+  local sub=${1:-status}
+  shift 2>/dev/null || true
+  case "$sub" in
+    _daemon) cmd_daemon ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    status | '') cmd_status ;;
+    log) cmd_log "$@" ;;
+    -h | --help | help) usage ;;
+    *) fleet_err "未知的 watch 子命令:$sub"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

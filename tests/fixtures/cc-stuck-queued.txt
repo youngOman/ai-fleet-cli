@@ -1,0 +1,26 @@
+# 來源:手工構造。錄製當下沒有處於這個狀態的 worker,依 adapters/cc.conf 的 regex
+# 與 cc-busy.txt 的真實外殼組出來。
+#
+# 情境:worker 正在跑東西,期間又收到一則訊息 → TUI 把它排進佇列並在畫面上
+# 提示「按上鍵可以編輯排隊中的訊息」。**這不是卡住**,做完自然會消化。
+# 判定必須是 busy=真、卡住訊號=真、但「真卡住」=假(卡住訊號 && 非 busy)。
+# 少了「非 busy」這個條件,每個忙碌中被追訊息的 worker 都會噴一次假警報。
+
+⏺ 先確認上游有沒有問題,再往下查。
+
+  Ran 1 shell command
+
+⏺ 上游正常,所以根因在中間層。繼續往下拆。
+
+⏺ Running 2 shell commands…
+  ⎿  $ 佔位命令一
+     佔位命令二
+
+✶ Enchanting… (12m 04s · ↓ 31.2k tokens)
+  ⎿  Press up to edit queued messages
+                                                          ✘ Auto-update failed · Run claude doctor
+──────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────
+   ✱ Opus 5 (1M context)  ~/w/demo  ⎇ feat/example ✓  § $0.42 (1.2M tokens)  ◆ 12  ◔ 66%
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fleet-state — 回報閉環的狀態機。
+
+唯一會寫 state.json 的程式。所有「要不要通知」的判斷都在這裡,
+因為這些是純函式邏輯,搬到 python 才測得起來(tests/test_state.py)。
+bash 那邊只負責 tmux I/O——那部分不可測,只能靠 fixture。
+
+設計要點:
+  * state.json 的 key **直接用報告檔名原文**。舊版用 `tr -c 'A-Za-z0-9_.-' '_'`
+    逐 byte 轉碼,中文主題會被壓成一串 `_`,兩份同日同 worker 的中文報告
+    會撞 key、後者永久靜音。JSON key 本來就吃 UTF-8,這個 bug 直接消失。
+  * worker 名只接受能對上 registry 的 id(取最長匹配)。舊版用
+    `cut -d- -f3` 猜,檔名不合慣例就生出幽靈 worker,害 QUIET_AFTER_REPORT 失效。
+  * 寫檔一律 temp + os.replace(同一個檔案系統上是原子的)。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+
+SCHEMA_VERSION = 1
+
+
+# ---------------------------------------------------------------------------
+# state.json 讀寫
+# ---------------------------------------------------------------------------
+
+def empty_state() -> dict:
+    return {"version": SCHEMA_VERSION, "reports": {}, "workers": {}}
+
+
+def load_state(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return empty_state()
+    except (ValueError, OSError):
+        # 壞掉的 state 檔不該讓整套艦隊停擺:備份後重新開始。
+        # 最壞情況是重播一次通知,比永久卡死好。
+        try:
+            os.replace(path, path + ".corrupt")
+        except OSError:
+            pass
+        return empty_state()
+    if not isinstance(data, dict):
+        return empty_state()
+    data.setdefault("version", SCHEMA_VERSION)
+    data.setdefault("reports", {})
+    data.setdefault("workers", {})
+    return data
+
+
+def save_state(path: str, state: dict) -> None:
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=1, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def worker_entry(state: dict, wid: str) -> dict:
+    w = state["workers"].setdefault(wid, {})
+    w.setdefault("wasbusy", 0)
+    w.setdefault("lastreport", 0)
+    w.setdefault("stuck_since", 0)
+    w.setdefault("stuck_notified", False)
+    w.setdefault("idle_notified", False)
+    return w
+
+
+# ---------------------------------------------------------------------------
+# 報告檔解析
+# ---------------------------------------------------------------------------
+
+def file_md5(path: str) -> str:
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def parse_report_name(basename: str, ids):
+    """`<YYYYMMDD>-<HHMM>-<worker>-<主題>.md` → (worker, topic)。
+
+    worker 只接受能對上 registry 的 id,取最長匹配;對不上就回 '-'。
+    """
+    stem = basename[:-3] if basename.endswith(".md") else basename
+    rest = stem
+    parts = stem.split("-")
+    if len(parts) >= 3 and len(parts[0]) == 8 and parts[0].isdigit() \
+            and len(parts[1]) == 4 and parts[1].isdigit():
+        rest = "-".join(parts[2:])
+    for wid in sorted(ids, key=len, reverse=True):
+        if rest == wid:
+            return wid, ""
+        if rest.startswith(wid + "-"):
+            return wid, rest[len(wid) + 1:].replace("-", " ")
+    return "-", rest.replace("-", " ")
+
+
+def scan_dirs(dirs):
+    """回傳 [(絕對路徑, basename, mtime)],依實體路徑去重、依 mtime 由舊到新。"""
+    seen = set()
+    out = []
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".md"):
+                continue
+            p = os.path.join(d, name)
+            try:
+                real = os.path.realpath(p)
+                st = os.stat(p)
+            except OSError:
+                continue
+            if not os.path.isfile(real) or real in seen:
+                continue
+            seen.add(real)
+            out.append((p, name, int(st.st_mtime)))
+    out.sort(key=lambda x: x[2])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 決策:哪些報告該通知
+# ---------------------------------------------------------------------------
+
+def plan_reports(state, dirs, now, stable, backfill, max_attempts, ids):
+    """回傳 [(path, tag, worker, topic)];會就地寫入 backfill 基準線。
+
+    純函式(除了改 state dict),不碰檔案系統以外的東西,方便測試。
+    """
+    todo = []
+    for path, name, mtime in scan_dirs(dirs):
+        entry = state["reports"].get(name)
+
+        if entry is None:
+            # 首次見到。watcher 剛啟動時整個報告目錄都是「首次見到」,
+            # 不擋的話會一口氣洗版指揮官(實際發生過,一次 6 則)。
+            if now - mtime > backfill:
+                state["reports"][name] = {
+                    "mtime": mtime,
+                    "hash": file_md5(path),
+                    "attempts": 0,
+                    "notified_at": 0,
+                    "backfilled": True,
+                }
+                continue
+        else:
+            digest = file_md5(path)
+            if digest and digest == entry.get("hash"):
+                # mtime 變了但內容沒變(編輯器 touch / 重存同文)→ 只記帳不通知
+                if mtime != entry.get("mtime"):
+                    entry["mtime"] = mtime
+                continue
+            if entry.get("attempts", 0) >= max_attempts \
+                    and entry.get("attempt_mtime") == mtime:
+                # 熔斷:同一版連送 max_attempts 次都驗不到,放棄。
+                # 寧漏勿轟——報告本來就還在報告目錄裡,指揮官撈得到。
+                continue
+
+        # 檔案靜置夠久才算落地,避免半寫入就通知
+        if now - mtime < stable:
+            continue
+
+        worker, topic = parse_report_name(name, ids)
+        todo.append((path, "r%d" % mtime, worker, topic))
+    return todo
+
+
+def record_report(state, path, result, now, max_attempts):
+    name = os.path.basename(path)
+    try:
+        mtime = int(os.stat(path).st_mtime)
+    except OSError:
+        return
+    entry = state["reports"].setdefault(name, {"attempts": 0})
+    if result == "ok":
+        entry["mtime"] = mtime
+        entry["hash"] = file_md5(path)
+        entry["attempts"] = 0
+        entry["notified_at"] = now
+        entry.pop("attempt_mtime", None)
+    elif result == "fail":
+        if entry.get("attempt_mtime") != mtime:
+            entry["attempts"] = 0
+        entry["attempt_mtime"] = mtime
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+    # result == "skip":使用者在打字 / TUI 沒起來 → 完全不記帳,下輪再試
+
+
+# ---------------------------------------------------------------------------
+# 決策:worker 狀態轉換
+# ---------------------------------------------------------------------------
+
+def worker_tick(state, wid, busy, stuck, now, idle_secs, stuck_secs, quiet_after):
+    """回傳 notify 動作清單(可能同時有 stuck 與 idle,但實務上互斥)。"""
+    w = worker_entry(state, wid)
+    actions = []
+
+    # 卡住:只有「有卡住訊號 + 不忙」才算真卡住。
+    # 忙的時候訊息排隊顯示 Press up to edit queued messages 是正常的,
+    # 不加這個條件會一直發假警報。
+    if stuck and not busy:
+        if not w["stuck_since"]:
+            w["stuck_since"] = now
+        elif now - w["stuck_since"] >= stuck_secs and not w["stuck_notified"]:
+            actions.append("notify-stuck")
+    else:
+        w["stuck_since"] = 0
+        w["stuck_notified"] = False
+
+    if busy:
+        w["wasbusy"] = now
+        w["idle_notified"] = False
+    elif w["wasbusy"]:
+        if now - w["wasbusy"] >= idle_secs and not w["idle_notified"]:
+            if now - w["lastreport"] < quiet_after:
+                # 剛交過報告就閒下來是正常的,不吵
+                w["wasbusy"] = 0
+            else:
+                actions.append("notify-idle")
+    return actions
+
+
+def record_worker(state, wid, event, now):
+    w = worker_entry(state, wid)
+    if event == "stuck-notified":
+        w["stuck_notified"] = True
+    elif event == "idle-notified":
+        w["idle_notified"] = True
+        w["wasbusy"] = 0
+    elif event == "report":
+        w["lastreport"] = now
+        w["wasbusy"] = 0
+        w["idle_notified"] = False
+
+
+def gc(state, dirs, ids):
+    """移除已不存在的報告 entry,與不在 registry 的 worker entry。"""
+    alive = set()
+    for _, name, _ in scan_dirs(dirs):
+        alive.add(name)
+    dropped_reports = [k for k in state["reports"] if k not in alive]
+    for k in dropped_reports:
+        del state["reports"][k]
+    idset = set(ids)
+    dropped_workers = [k for k in state["workers"] if k not in idset]
+    for k in dropped_workers:
+        del state["workers"][k]
+    return len(dropped_reports), len(dropped_workers)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def split_ids(s):
+    return [x for x in (s or "").replace("\n", " ").split(" ") if x]
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-state", add_help=True)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--state", required=True)
+
+    p = sub.add_parser("plan-reports")
+    common(p)
+    p.add_argument("--dir", action="append", default=[])
+    p.add_argument("--now", type=int, default=None)
+    p.add_argument("--stable", type=int, default=3)
+    p.add_argument("--backfill", type=int, default=600)
+    p.add_argument("--max-attempts", type=int, default=3)
+    p.add_argument("--ids", default="")
+
+    p = sub.add_parser("record-report")
+    common(p)
+    p.add_argument("--path", required=True)
+    p.add_argument("--result", required=True, choices=["ok", "fail", "skip"])
+    p.add_argument("--now", type=int, default=None)
+    p.add_argument("--max-attempts", type=int, default=3)
+
+    p = sub.add_parser("worker-tick")
+    common(p)
+    p.add_argument("--id", required=True)
+    p.add_argument("--busy", type=int, default=0)
+    p.add_argument("--stuck", type=int, default=0)
+    p.add_argument("--now", type=int, default=None)
+    p.add_argument("--idle-secs", type=int, default=90)
+    p.add_argument("--stuck-secs", type=int, default=60)
+    p.add_argument("--quiet-after", type=int, default=300)
+
+    p = sub.add_parser("record-worker")
+    common(p)
+    p.add_argument("--id", required=True)
+    p.add_argument("--event", required=True,
+                   choices=["stuck-notified", "idle-notified", "report"])
+    p.add_argument("--now", type=int, default=None)
+
+    p = sub.add_parser("gc")
+    common(p)
+    p.add_argument("--dir", action="append", default=[])
+    p.add_argument("--ids", default="")
+
+    p = sub.add_parser("dump")
+    common(p)
+
+    args = ap.parse_args(argv)
+    now = getattr(args, "now", None) or int(time.time())
+    state = load_state(args.state)
+
+    if args.cmd == "plan-reports":
+        todo = plan_reports(state, args.dir, now, args.stable, args.backfill,
+                            args.max_attempts, split_ids(args.ids))
+        save_state(args.state, state)
+        for path, tag, worker, topic in todo:
+            sys.stdout.write("%s\t%s\t%s\t%s\n" % (path, tag, worker, topic))
+
+    elif args.cmd == "record-report":
+        record_report(state, args.path, args.result, now, args.max_attempts)
+        save_state(args.state, state)
+
+    elif args.cmd == "worker-tick":
+        actions = worker_tick(state, args.id, bool(args.busy), bool(args.stuck),
+                              now, args.idle_secs, args.stuck_secs, args.quiet_after)
+        save_state(args.state, state)
+        for a in actions:
+            sys.stdout.write(a + "\n")
+
+    elif args.cmd == "record-worker":
+        record_worker(state, args.id, args.event, now)
+        save_state(args.state, state)
+
+    elif args.cmd == "gc":
+        nr, nw = gc(state, args.dir, split_ids(args.ids))
+        save_state(args.state, state)
+        sys.stdout.write("移除報告記錄 %d 筆、worker 記錄 %d 筆\n" % (nr, nw))
+
+    elif args.cmd == "dump":
+        json.dump(state, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

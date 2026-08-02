@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# 這個 repo 正在建置中，很多檔案還沒生出來。
+# 每個步驟都用明確的 `if [ -f ... ]` 判斷「檔案不存在就跳過」，
+# 刻意不用 continue-on-error —— 那會把真正的失敗一起吞掉。
+jobs:
+  test:
+    name: 測試（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安裝相依工具（tmux / bats / shellcheck）
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends tmux bats shellcheck
+          else
+            # 先看指令在不在 PATH 上，避免對 runner 已預裝的工具重複 brew install
+            # （重複安裝會因為 link 衝突讓 CI 無故變紅）
+            command -v tmux       >/dev/null 2>&1 || brew install tmux
+            command -v bats       >/dev/null 2>&1 || brew install bats-core
+            command -v shellcheck >/dev/null 2>&1 || brew install shellcheck
+          fi
+
+      - name: 顯示工具版本
+        run: |
+          set -e
+          tmux -V
+          bats --version
+          shellcheck --version | head -n 3
+          python3 --version
+
+      - name: shellcheck
+        run: |
+          set -e
+          targets=()
+          for f in bin/fleet lib/*.sh libexec/fleet-watcher libexec/fleet-doctor install.sh scripts/*.sh; do
+            if [ -f "$f" ]; then
+              targets[${#targets[@]}]="$f"
+            fi
+          done
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "沒有可檢查的 shell 腳本，跳過 shellcheck。"
+          else
+            printf '檢查：%s\n' "${targets[*]}"
+            # -e SC1091：source 的檔案在 CI 上找不到是預期的，不是問題
+            shellcheck -S warning -e SC1091 "${targets[@]}"
+          fi
+
+      - name: python 單元測試
+        run: |
+          set -e
+          if ls tests/test_*.py >/dev/null 2>&1; then
+            python3 -m unittest discover -s tests -p 'test_*.py' -v
+          else
+            echo "tests/ 下沒有 test_*.py，跳過 python 測試。"
+          fi
+
+      - name: bats 測試
+        run: |
+          set -e
+          if ls tests/*.bats >/dev/null 2>&1; then
+            bats tests/*.bats
+          else
+            echo "tests/ 下沒有 .bats，跳過 bats 測試。"
+          fi
+
+      - name: release gate（掃個人資料 / 憑證）
+        run: |
+          set -e
+          if [ -f scripts/scan.py ]; then
+            python3 scripts/scan.py
+          else
+            echo "沒有 scripts/scan.py，跳過 release gate。"
+          fi
+
+      - name: 版本一致性檢查
+        run: |
+          set -e
+          if [ ! -f scripts/check-version.sh ]; then
+            echo "沒有 scripts/check-version.sh，跳過。"
+          elif [ ! -f bin/fleet ] || [ ! -f CHANGELOG.md ]; then
+            echo "bin/fleet 或 CHANGELOG.md 尚未建立，跳過版本一致性檢查。"
+          else
+            bash scripts/check-version.sh
+          fi

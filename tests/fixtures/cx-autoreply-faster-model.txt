@@ -1,0 +1,19 @@
+# 來源:手工構造。依 adapters/cx.conf 的 autoreply1_match 與 cx-idle.txt 的真實外殼組出來。
+#
+# codex 在高負載時會跳出「要不要降級到快模型」的攔截框,沒人按就一直卡著。
+# watcher 巡邏時比對到 autoreply1_match 就自動送 autoreply1_keys(=2,不降級)。
+# 這個檔釘住的是「攔截框長這樣、規則抓得到」。
+
+• Ran 佔位命令
+  │ 佔位輸出
+
+────────────────────────────────────────────────────
+
+  Retry with a faster model?
+
+  1. Yes, use the faster model
+  2. No, keep waiting for the current model
+
+›
+
+  gpt-5.6-sol high · ~/w/demo

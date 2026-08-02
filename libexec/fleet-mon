@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fleet-mon — AI 艦隊即時狀態看板。
+
+用法:
+  fleet mon              印一次目前狀態
+  fleet mon -w           持續刷新(預設 3 秒,Ctrl-C 離開)
+  fleet mon -w 5         自訂刷新秒數
+  fleet mon --no-color   關掉顏色
+
+為什麼是 python 不是 shell:worker 畫面含大量 UTF-8 框線與 emoji,
+macOS 的 BSD sed/grep 在預設 locale 下會噴 "illegal byte sequence"。
+python3 原生處理 UTF-8,不看 locale 臉色。
+
+設計要點:
+  * **訊號 regex 一律從 `$FLEET_LIBDIR/adapters/<kind>.conf` 讀。**
+    這裡不再抄一份。舊版把同一組 regex 複製到看板裡,結果跟 lib/signals.sh
+    漂移:看板少了 [Pasted Content,於是卡訊的 worker 在看板上顯示閒置。
+  * 顯示寬度用 `unicodedata.east_asian_width` 算,不用 `ord(ch) > 0x1100`
+    那種啟發式。啟發式在 emoji(❓ U+2753 是 W 但落在舊版的例外區間)與
+    組合字(U+FE0F 變體選擇子)上會算錯,表格就整排歪掉。
+  * **先 pad 純文字、最後才包顏色碼。** 舊版在 ctx 標紅時手工補 padding,
+    標紅與不標紅的欄寬因此不一致。
+  * 不硬編任何個人目錄前綴。「位置」只做 $HOME → ~ 與「留末兩層」。
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+
+# ---------------------------------------------------------------------------
+# 執行期路徑
+#
+# bin/fleet 會把這些都 export 好再呼叫;這裡仍給同一套預設值,
+# 讓 `python3 libexec/fleet-mon` 可以單獨執行(debug / CI 用)。
+# 推導順序與 lib/core.sh 的 fleet_init_paths 必須一致。
+# ---------------------------------------------------------------------------
+
+def _env(name, default):
+    v = os.environ.get(name)
+    return v if v else default
+
+
+HOME = os.path.expanduser("~")
+# libexec/fleet-mon → repo 根
+LIBDIR = _env("FLEET_LIBDIR",
+              os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ADAPTER_DIR = _env("FLEET_ADAPTER_DIR", os.path.join(LIBDIR, "adapters"))
+
+FLEET_HOME = _env("FLEET_HOME",
+                  os.path.join(_env("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
+                               "fleet"))
+PROFILE = _env("FLEET_PROFILE", "default")
+PROFILE_DIR = _env("FLEET_PROFILE_DIR",
+                   os.path.join(FLEET_HOME, "profiles", PROFILE))
+REG = _env("FLEET_REG", os.path.join(PROFILE_DIR, "registry"))
+STATE_FILE = _env("FLEET_STATE_FILE", os.path.join(PROFILE_DIR, "state.json"))
+PIDFILE = _env("FLEET_PIDFILE", os.path.join(PROFILE_DIR, "watch.pid"))
+REPORTS = _env("FLEET_REPORTS", os.path.join(HOME, "fleet", "reports"))
+TASKS = _env("FLEET_TASKS", os.path.join(HOME, "fleet", "tasks"))
+
+CAPTURE_LINES = 60      # capture-pane -S -N
+TMUX_TIMEOUT = 5        # 秒;tmux 卡住不該讓整個看板卡住
+
+# ---------------------------------------------------------------------------
+# 顏色
+# ---------------------------------------------------------------------------
+
+_RAW_COLORS = {
+    "rst": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
+    "grn": "\033[32m", "ylw": "\033[33m", "red": "\033[31m",
+    "cyn": "\033[36m", "mag": "\033[35m", "gry": "\033[90m",
+}
+C = dict((k, "") for k in _RAW_COLORS)
+
+
+def set_color(enabled):
+    """顏色開關。NO_COLOR、非 TTY、--no-color 都會關掉。"""
+    for k in _RAW_COLORS:
+        C[k] = _RAW_COLORS[k] if enabled else ""
+
+
+def paint(key, text):
+    """把顏色包在**已經 pad 好**的字串外面。順序反過來欄寬就會錯。"""
+    if not C[key]:
+        return text
+    return C[key] + text + C["rst"]
+
+
+# ---------------------------------------------------------------------------
+# adapter:訊號 regex 的唯一來源
+# ---------------------------------------------------------------------------
+
+# ERE 的 POSIX 字元類 python re 不認得,載入時展開。
+# adapters/*.conf 只能用 ERE ∩ python re,這是唯一需要翻譯的部分。
+_POSIX_CLASSES = {
+    "[:alpha:]": "a-zA-Z",
+    "[:digit:]": "0-9",
+    "[:alnum:]": "a-zA-Z0-9",
+    "[:upper:]": "A-Z",
+    "[:lower:]": "a-z",
+    "[:space:]": " \\t\\n\\r\\f\\v",
+    "[:blank:]": " \\t",
+    "[:punct:]": "!-/:-@\\[-`{-~",
+    "[:xdigit:]": "0-9A-Fa-f",
+}
+
+_ADAPTER_CACHE = {}
+_REGEX_CACHE = {}
+_KEY_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+def ere_to_python(pattern):
+    for name, expansion in _POSIX_CLASSES.items():
+        pattern = pattern.replace(name, expansion)
+    return pattern
+
+
+def load_adapter(kind):
+    """讀 adapters/<kind>.conf → dict。讀不到就回空 dict(不 crash)。"""
+    if kind in _ADAPTER_CACHE:
+        return _ADAPTER_CACHE[kind]
+    conf = {}
+    if _KEY_RE.match(kind or ""):
+        path = os.path.join(ADAPTER_DIR, kind + ".conf")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if not line or line.lstrip().startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    if not _KEY_RE.match(key):
+                        continue
+                    conf[key] = val
+        except OSError:
+            pass
+    _ADAPTER_CACHE[kind] = conf
+    return conf
+
+
+def signal_re(kind, key):
+    """取某個訊號的已編譯 regex。
+
+    值為空(例如 cx.conf 的 `ctx=`)或編不起來 → 回 None,呼叫端一律當「沒有這個訊號」。
+    **絕對不能把空字串拿去 compile** —— 空 pattern 什麼都比得中。
+    """
+    ck = (kind, key)
+    if ck in _REGEX_CACHE:
+        return _REGEX_CACHE[ck]
+    raw = load_adapter(kind).get(key, "")
+    rx = None
+    if raw:
+        try:
+            rx = re.compile(ere_to_python(raw))
+        except re.error:
+            rx = None
+    _REGEX_CACHE[ck] = rx
+    return rx
+
+
+def signal_match(kind, key, content):
+    rx = signal_re(kind, key)
+    return bool(rx and rx.search(content))
+
+
+# ---------------------------------------------------------------------------
+# 顯示寬度(東亞寬字元 / emoji / 組合字)
+# ---------------------------------------------------------------------------
+
+def char_width(ch):
+    cat = unicodedata.category(ch)
+    if cat in ("Mn", "Me", "Cf"):
+        # 組合附加符號、變體選擇子(U+FE0F)、ZWJ:不佔格
+        return 0
+    if cat == "Cc":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def dwidth(s):
+    return sum(char_width(ch) for ch in s)
+
+
+def fit(s, n):
+    """截斷到顯示寬度 n,被截斷就補 '…'。回傳 (文字, 實際顯示寬度)。"""
+    s = s.replace("\t", " ")
+    w = dwidth(s)
+    if w <= n:
+        return s, w
+    if n <= 0:
+        return "", 0
+    if n == 1:
+        return "…", 1
+    out = []
+    w = 0
+    for ch in s:
+        cw = char_width(ch)
+        if w + cw > n - 1:
+            break
+        out.append(ch)
+        w += cw
+    out.append("…")
+    return "".join(out), w + 1
+
+
+def pad(s, n):
+    """先算純文字寬度再補空白。顏色要在這之後才包。"""
+    t, w = fit(s, n)
+    return t + " " * max(0, n - w)
+
+
+# ---------------------------------------------------------------------------
+# registry / tmux
+# ---------------------------------------------------------------------------
+
+def read_registry(path=REG):
+    """registry:`id<TAB>socket<TAB>pane<TAB>kind`,一列一個 worker。"""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        out.append({
+            "id": parts[0].strip(),
+            "sock": parts[1].strip(),
+            "pane": parts[2].strip(),
+            "kind": parts[3].strip(),
+        })
+    return out
+
+
+def tmux(sock, *args):
+    """socket 為 '-' 或空 → 預設 socket,否則 `tmux -L <socket>`。
+
+    errors="replace" 不可省:worker 畫面偶爾會被 capture 切在多位元組序列
+    中間,不處理會丟 UnicodeDecodeError 讓整個看板掛掉。
+    """
+    base = ["tmux"] if sock in ("-", "", None) else ["tmux", "-L", sock]
+    try:
+        p = subprocess.run(base + list(args), capture_output=True, text=True,
+                           errors="replace", timeout=TMUX_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return p.returncode, p.stdout or ""
+
+
+def list_panes(sock):
+    """一個 socket 問一次:`pane_id → pane_current_path`。
+
+    這同時解決「pane 還在不在」——比拿 capture-pane 的空輸出當失聯可靠:
+    一個真的空白的 pane 不該被判成失聯。
+    """
+    rc, out = tmux(sock, "list-panes", "-a", "-F",
+                   "#{pane_id}\t#{pane_current_path}")
+    panes = {}
+    if rc != 0:
+        return panes
+    for line in out.splitlines():
+        if "\t" not in line:
+            continue
+        pid, path = line.split("\t", 1)
+        panes[pid.strip()] = path.strip()
+    return panes
+
+
+# ---------------------------------------------------------------------------
+# 「在做什麼」的雜訊過濾
+#
+# 這些是**顯示用啟發式**,不是訊號判定,所以留在這裡而不是 adapter:
+# adapter 是「這個 CLI 忙不忙」的契約,不該被看板的排版偏好污染。
+# ---------------------------------------------------------------------------
+
+# 整行只有框線 / 裝飾字元 → 沒有資訊
+NOISE_LINE = re.compile(r"^[\s─-╿│─└├┌┐┘╭╮╯╰⏵❯›»✻✽✳✶✢·•◯○●⎿\-=_.]*$")
+
+# 行內出現這些就是 TUI 狀態列 / 快捷鍵提示 / 模型名,不是「在做什麼」。
+# 必須用 search 不是 match —— 這些字前面通常還有 ⏵⏵ 之類的裝飾字元。
+NOISE_SUB = re.compile(
+    r"bypass permissions|Auto-update|Tip: Use|for shortcuts|shift\+tab"
+    r"|for agents|Resume this session|claude --resume|Enter to select"
+    r"|to navigate|/model to change|YOLO mode|context left|Context left"
+    r"|gpt-[0-9]|Opus [0-9]|Sonnet [0-9]|Haiku [0-9]|claude-[a-z0-9]"
+    r"|^\s*\?\s+for\b|to interrupt\)\s*$"
+)
+
+WS = re.compile(r"\s+")
+
+
+def last_meaningful_line(screen):
+    """由後往前找最後一行有意義的內容。"""
+    for line in reversed(screen.splitlines()):
+        t = line.strip()
+        if not t or len(t) < 4:
+            continue
+        if NOISE_LINE.match(t):
+            continue
+        if NOISE_SUB.search(t):
+            continue
+        # 去掉行首的裝飾字元(⏺ ● > ⎿ 之類),留下實際內容
+        t = t.lstrip("⏺●○◯>⎿│├└─•·*# \t")
+        t = WS.sub(" ", t).strip()
+        if len(t) >= 4:
+            return t
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 單一 worker 的狀態
+# ---------------------------------------------------------------------------
+
+STATES = ("失聯", "卡訊", "等答", "跑中", "閒置")
+
+
+def shorten_path(path):
+    """$HOME → ~,只留末兩層。**不硬編任何個人目錄前綴。**
+
+    舊版寫死剝掉 `~/Developer/`,換一台機器或換一個放 repo 的目錄就毫無意義,
+    而且會把 `~/Developer` 本身顯示成空字串。
+    """
+    if not path:
+        return ""
+    if path == HOME:
+        return "~"
+    if path.startswith(HOME + os.sep):
+        path = "~" + path[len(HOME):]
+    parts = [p for p in path.split("/") if p]
+    if len(parts) > 2:
+        return "/".join(parts[-2:])
+    return "/".join(parts) if parts else path
+
+
+def inspect(w, panes):
+    """回傳一列看板資料。pane 不在 panes 裡就是失聯,連 capture 都不用做。"""
+    row = dict(w, state="", ctx="", where="", doing="")
+    if w["pane"] not in panes:
+        row["state"] = "失聯"
+        row["where"] = "pane 不見了"
+        row["doing"] = "registry 記的 pane 已不存在 → fleet forget %s" % w["id"]
+        return row
+
+    kind = w["kind"]
+    rc, screen = tmux(w["sock"], "capture-pane", "-p", "-t", w["pane"],
+                      "-S", "-%d" % CAPTURE_LINES)
+    if rc != 0:
+        row["state"] = "失聯"
+        row["where"] = shorten_path(panes.get(w["pane"], ""))
+        row["doing"] = "capture-pane 失敗"
+        return row
+
+    busy = signal_match(kind, "busy", screen)
+    stuck = signal_match(kind, "stuck", screen)
+    asking = signal_match(kind, "asking", screen)
+
+    # 判定優先序固定:失聯 → 卡訊 → 等答 → 跑中 → 閒置。
+    # 「卡訊」必須加上 not busy:worker 忙的時候收到訊息會排隊顯示
+    # Press up to edit queued messages,做完自然會消化,那是正常的。
+    if stuck and not busy:
+        row["state"] = "卡訊"
+    elif asking:
+        row["state"] = "等答"
+    elif busy:
+        row["state"] = "跑中"
+    else:
+        row["state"] = "閒置"
+
+    row["ctx"] = scrape_ctx(kind, screen)
+    row["where"] = shorten_path(panes.get(w["pane"], ""))
+    if row["state"] == "等答":
+        row["doing"] = "★ 停在互動選單,在等你回答"
+    else:
+        row["doing"] = last_meaningful_line(screen)
+    return row
+
+
+def scrape_ctx(kind, screen):
+    """用 adapter 的 `ctx` regex 從畫面刮百分比。
+
+    這個欄位是**直接讀 TUI 狀態列印出來的數字**,不是 fleet 自己算的。
+    adapter 沒定義 ctx(例如 cx.conf 的 `ctx=` 是空的)就一律回空字串。
+    """
+    rx = signal_re(kind, "ctx")
+    if rx is None:
+        return ""
+    m = rx.search(screen)
+    if not m:
+        return ""
+    try:
+        val = m.group(1)
+    except (IndexError, re.error):
+        val = m.group(0)
+    val = (val or "").strip()
+    return (val + "%") if val.isdigit() else val
+
+
+# ---------------------------------------------------------------------------
+# 底部資訊列
+# ---------------------------------------------------------------------------
+
+def watcher_status():
+    """讀 $FLEET_PIDFILE 並用 os.kill(pid, 0) 判活。"""
+    try:
+        with open(PIDFILE, "r", encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def latest_report():
+    """報告目錄裡 mtime 最新的一份 → (檔名, mtime)。"""
+    try:
+        files = glob.glob(os.path.join(REPORTS, "*.md"))
+    except OSError:
+        return None
+    newest = None
+    for f in files:
+        try:
+            mt = os.stat(f).st_mtime
+        except OSError:
+            continue
+        if newest is None or mt > newest[1]:
+            newest = (os.path.basename(f), mt)
+    return newest
+
+
+# ---------------------------------------------------------------------------
+# 排版
+# ---------------------------------------------------------------------------
+
+COL_ID = 10
+COL_KIND = 5
+COL_STATE = 8
+COL_CTX = 6
+COL_WHERE = 26
+GAP = " "
+
+BADGE = {
+    "跑中": ("grn", "🏃跑中"),
+    "等答": ("mag", "❓等答"),
+    "卡訊": ("ylw", "🚧卡訊"),
+    "閒置": ("gry", "😴閒置"),
+    "失聯": ("red", "💀失聯"),
+}
+
+
+def term_width():
+    try:
+        return max(60, shutil.get_terminal_size(fallback=(100, 24)).columns)
+    except Exception:
+        return 100
+
+
+def render():
+    rows = []
+    workers = read_registry()
+    if workers:
+        panes = {}
+        for sock in sorted(set(w["sock"] for w in workers)):
+            panes[sock] = list_panes(sock)
+        rows = [inspect(w, panes.get(w["sock"], {})) for w in workers]
+
+    width = term_width()
+    fixed = COL_ID + COL_KIND + COL_STATE + COL_CTX + COL_WHERE + 5 * len(GAP)
+    col_doing = max(20, width - fixed - 1)
+    rule = paint("gry", "─" * min(width - 1, fixed + col_doing))
+
+    out = []
+    header = "%s AI 艦隊" % "🚢"
+    out.append("%s  %s   profile: %s   %s" % (
+        paint("bold", header),
+        paint("dim", time.strftime("%H:%M:%S")),
+        paint("cyn", PROFILE),
+        watcher_line(),
+    ))
+    out.append(rule)
+    out.append(paint("dim", GAP.join([
+        pad("WORKER", COL_ID), pad("型", COL_KIND), pad("狀態", COL_STATE),
+        pad("ctx", COL_CTX), pad("位置", COL_WHERE), "在做什麼",
+    ])))
+    out.append(paint("dim",
+                     "  (ctx = 直接讀 worker TUI 狀態列上的數字,只有 adapter 有定義 "
+                     "ctx= 的 CLI 才有,其餘顯示 -)"))
+    out.append(rule)
+
+    if not rows:
+        out.append("")
+        out.append("  " + paint("ylw", "還沒有 worker。"))
+        out.append("  " + paint("dim", "fleet discover 找找看有哪些 pane 可以納管,"
+                                       "或 fleet up --cc 直接開一個。"))
+        out.append("  " + paint("dim", "registry: %s" % REG))
+        out.append("")
+    for r in rows:
+        out.append(render_row(r, col_doing))
+
+    out.append(rule)
+    out.extend(footer(rows))
+    return "\n".join(out)
+
+
+def render_row(r, col_doing):
+    color, label = BADGE.get(r["state"], ("", r["state"]))
+    ctx_text = r["ctx"] or "-"
+    ctx_cell = pad(ctx_text, COL_CTX)
+    # 先 pad 純文字再上色,標紅與不標紅的欄寬才會一致。
+    if r["ctx"] and r["ctx"].rstrip("%").isdigit() and int(r["ctx"].rstrip("%")) < 20:
+        ctx_cell = paint("red", ctx_cell)
+    else:
+        ctx_cell = paint("dim", ctx_cell)
+    return GAP.join([
+        paint("ylw", pad(r["id"], COL_ID)),
+        paint("dim", pad(r["kind"], COL_KIND)),
+        paint(color, pad(label, COL_STATE)) if color else pad(label, COL_STATE),
+        ctx_cell,
+        pad(r["where"], COL_WHERE),
+        paint("dim", pad(r["doing"], col_doing)),
+    ]).rstrip()
+
+
+def watcher_line():
+    pid = watcher_status()
+    if pid:
+        return paint("grn", "watcher: 運作中 (pid %d)" % pid)
+    return paint("red", "watcher: 未執行") + paint("dim", " (fleet watch start)")
+
+
+def footer(rows):
+    lines = []
+    rep = latest_report()
+    if rep:
+        lines.append("  %s %s  %s" % (
+            paint("cyn", "📥 最近報告"),
+            time.strftime("%m-%d %H:%M", time.localtime(rep[1])),
+            rep[0]))
+    else:
+        lines.append("  %s %s" % (paint("cyn", "📥 最近報告"),
+                                  paint("dim", "(%s 下還沒有 .md)" % REPORTS)))
+
+    stuck = [r["id"] for r in rows if r["state"] == "卡訊"]
+    asking = [r["id"] for r in rows if r["state"] == "等答"]
+    lost = [r["id"] for r in rows if r["state"] == "失聯"]
+    if asking:
+        lines.append("  " + paint("mag", "❗ %s 在等你回答 —— fleet peek %s"
+                                  % ("、".join(asking), asking[0])))
+    if stuck:
+        lines.append("  " + paint("ylw", "❗ %s 訊息卡在輸入框 —— fleet peek %s"
+                                  % ("、".join(stuck), stuck[0])))
+    if lost:
+        lines.append("  " + paint("red", "❗ %s 失聯 —— fleet forget %s 或重新 adopt"
+                                  % ("、".join(lost), lost[0])))
+    if rows and not (asking or stuck or lost):
+        lines.append("  " + paint("dim", "fleet -w 持續刷新 · fleet peek <id> 讀畫面 · "
+                                         "fleet task <id> <brief> 派工 · "
+                                         "fleet lint --all 驗報告"))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP_EPILOG = """\
+欄位說明:
+  WORKER    registry 裡的 worker id
+  型        adapter 種類(對應 adapters/<kind>.conf)
+  狀態      失聯 / 卡訊 / 等答 / 跑中 / 閒置(判定優先序即此順序)
+            訊號 regex 全部來自 adapters/<kind>.conf,看板不另存一份
+  ctx       **直接讀 worker TUI 狀態列印出來的百分比**,由 adapter 的 ctx=
+            regex 刮出來。fleet 不會自己估算,adapter 沒定義(例如 codex)
+            就一律顯示 -。低於 20 標紅 → 該安排交接了
+  位置      pane 的 current path($HOME 顯示成 ~,只留末兩層)
+  在做什麼  畫面上最後一行有意義的內容(略過框線、狀態列、模型名)
+
+註:-w 需要真 TTY。被 pipe 或重導向時只印一張快照就結束(exit 0),
+   不會進無限迴圈。
+"""
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="fleet mon", description="AI 艦隊即時狀態看板",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_EPILOG)
+    ap.add_argument("-w", "--watch", nargs="?", const=3.0, type=float,
+                    default=None, metavar="秒",
+                    help="持續刷新(預設 3 秒;需要真 TTY)")
+    ap.add_argument("-1", "--once", action="store_true",
+                    help="只印一次(預設行為)")
+    ap.add_argument("--no-color", action="store_true", help="關掉顏色")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    isatty = sys.stdout.isatty()
+    set_color(not args.no_color and isatty and not os.environ.get("NO_COLOR"))
+
+    if args.watch is None or args.once:
+        print(render())
+        return 0
+
+    if not isatty:
+        # 沒有 TTY 時 while True + ANSI 清畫面 = 卡死且沉默。
+        # 印一張快照就走,並說清楚為什麼沒有持續刷新。
+        print(render())
+        print("\n(沒有 TTY,-w 只印一張快照。要持續刷新請在終端機直接跑 fleet -w)")
+        return 0
+
+    every = args.watch if args.watch and args.watch > 0 else 3.0
+    try:
+        while True:
+            sys.stdout.write("\033[H\033[J" + render() + "\n")
+            sys.stdout.flush()
+            time.sleep(every)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # `fleet mon | head` 之類:安靜收工,不要噴 traceback
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)

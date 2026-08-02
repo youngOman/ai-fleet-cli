@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fleet-lint — 報告四節 schema 驗證。
+
+用法:
+  fleet lint <報告檔...>     驗指定的幾份
+  fleet lint --all           驗 $FLEET_REPORTS 底下所有 *.md
+  fleet lint --strict ...    warn 也算失敗
+
+為什麼要有這支:
+  「宣告完成」是整套艦隊最容易造假的一步。worker 說「已完成」但沒貼實跑輸出、
+  說「改好了」但沒說改在哪一行,指揮官要一份份翻才發現。這支把「一份報告
+  算不算完成」變成可執行的檢查,而不是靠讀者的耐心。
+
+  報告四節缺一不算完成:
+    1. 做了什麼(結論先講)
+    2. 改了哪些檔(要含 檔案:行號)
+    3. 怎麼驗證(要貼實際指令與輸出,不是「應該會過」)
+    4. 殘留問題
+
+嚴重度:
+  error  少了整節 —— 這份報告結構就不對,exit 1
+  warn   節在但內容可疑 —— 提醒,預設 exit 0
+
+  **warn 不擋工作流是刻意的。** 一個動不動就擋人的 lint,大家的反應是
+  繞過它,而不是修報告;那樣連 error 都會一起被繞過。要嚴格時才加 --strict。
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import sys
+
+ERROR = "error"
+WARN = "warn"
+
+
+def _env(name, default):
+    v = os.environ.get(name)
+    return v if v else default
+
+
+HOME = os.path.expanduser("~")
+REPORTS = _env("FLEET_REPORTS", os.path.join(HOME, "fleet", "reports"))
+
+
+# ---------------------------------------------------------------------------
+# 四節定義
+# ---------------------------------------------------------------------------
+
+# (正規名稱, 可接受的別名)
+# 別名刻意保守:只收語意等價的常見寫法。放太寬等於沒檢查,
+# 放太窄則會把只是換個詞的合格報告打成 error,大家就不用了。
+SECTIONS = [
+    ("做了什麼", ("做了什麼", "做了哪些", "本次變更", "結論")),
+    ("改了哪些檔", ("改了哪些檔", "改了什麼檔", "動了哪些檔", "改動檔案",
+                    "變更檔案", "檔案異動", "修改檔案", "異動檔案")),
+    ("怎麼驗證", ("怎麼驗證", "如何驗證", "驗證方式", "驗證證據", "驗證步驟",
+                  "驗證")),
+    ("殘留問題", ("殘留問題", "殘留", "未解問題", "已知問題", "未完成",
+                  "待處理", "後續待辦")),
+]
+
+# 假訊號用語。這些字樣出現就代表「沒有真的跑過」,是已知會出事的措辭。
+FAKE_SIGNALS = (
+    "應該會過", "應該沒問題", "應該可以過", "應該沒錯",
+    "等價執行", "等價驗證", "理論上沒問題", "理論上會過",
+)
+
+# markdown heading:# ~ ######
+RE_MD_HEADING = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+# 編號清單當標題:「1. 做了什麼」「一、做了什麼」「(2) 改了哪些檔」
+RE_NUM_HEADING = re.compile(
+    r"^\s{0,3}[(（\[【]?\s*(?:[0-9]{1,2}|[一二三四五六七八九十]{1,3})\s*"
+    r"[.、)）\]】:：]\s*(\S.*)$")
+# 粗體當標題:「**怎麼驗證**」
+RE_BOLD_HEADING = re.compile(r"^\s{0,3}\*\*\s*(.+?)\s*\*\*\s*[:：]?\s*$")
+
+# 標題正規化:去掉前後的編號、標點、emoji、空白、markdown 記號。
+# python re 的 \w 在 unicode 模式下含 CJK,所以中日韓字不會被剝掉。
+RE_STRIP_HEAD = re.compile(r"^[\W\d_]+", re.UNICODE)
+RE_STRIP_TAIL = re.compile(r"[\W\d_]+$", re.UNICODE)
+RE_MD_MARKS = re.compile(r"\*\*|__|`|~~")
+
+# 「檔案:行號」。要嘛帶副檔名(core.sh:88),要嘛帶路徑分隔(libexec/fleet-mon:12)。
+# 少了這個條件,「10:30」「#16443:2」這種都會被當成命中。
+RE_FILE_LINE = re.compile(
+    r"(?:[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-/]*[A-Za-z0-9_.\-]"
+    r"|[A-Za-z0-9_.\-]*[A-Za-z0-9_\-]\.[A-Za-z0-9]{1,8})"
+    r":\d+")
+
+RE_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+RE_INDENT_BLOCK = re.compile(r"^(?: {4,}|\t)\S")
+
+# 檔名慣例 <YYYYMMDD>-<HHMM>-<worker>-<主題>.md
+RE_NAME = re.compile(r"^(\d{8})-(\d{4})-([^-\s]+)-(\S.*)\.md$")
+
+
+class Issue(object):
+    __slots__ = ("path", "line", "level", "msg")
+
+    def __init__(self, path, line, level, msg):
+        self.path = path
+        self.line = line
+        self.level = level
+        self.msg = msg
+
+    def format(self):
+        return "%s:%d: [%s] %s" % (self.path, self.line, self.level, self.msg)
+
+
+# ---------------------------------------------------------------------------
+# 標題解析
+# ---------------------------------------------------------------------------
+
+def normalize_title(text):
+    text = RE_MD_MARKS.sub("", text or "")
+    text = RE_STRIP_HEAD.sub("", text)
+    text = RE_STRIP_TAIL.sub("", text)
+    return text.strip()
+
+
+def match_sections(title):
+    """正規化後的標題對得上哪幾節?
+
+    回傳 list —— 一個標題可能同時涵蓋兩節(「結論與殘留問題」),
+    只回第一個的話另一節會被誤判成缺席。
+    """
+    if not title:
+        return []
+    return [canonical for canonical, aliases in SECTIONS
+            if any(alias in title for alias in aliases)]
+
+
+def find_headings(lines):
+    """回傳 [(索引, 階層, [正規名稱...])]。
+
+    - markdown heading 一律是分節界線(階層 = # 的個數)
+    - 編號 / 粗體行**只有對得上四節之一時**才算標題(階層 1)。
+      不然「## 怎麼驗證」底下的「1. 跑測試」會把整節切斷,
+      後面的 code block 就被算到節外面去了。
+    """
+    out = []
+    fenced = False
+    for i, raw in enumerate(lines):
+        if RE_FENCE.match(raw):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+
+        m = RE_MD_HEADING.match(raw)
+        if m:
+            out.append((i, len(m.group(1)), match_sections(normalize_title(m.group(2)))))
+            continue
+
+        for rx in (RE_NUM_HEADING, RE_BOLD_HEADING):
+            m = rx.match(raw)
+            if not m:
+                continue
+            sects = match_sections(normalize_title(m.group(1)))
+            if sects:
+                out.append((i, 1, sects))
+            break
+    return out
+
+
+def section_ranges(lines):
+    """正規名稱 → (標題列索引, 內容起, 內容迄)。同名重複取第一個。"""
+    heads = find_headings(lines)
+    found = {}
+    for pos, (idx, level, sects) in enumerate(heads):
+        if not sects:
+            continue
+        end = len(lines)
+        for nidx, nlevel, _ in heads[pos + 1:]:
+            if nlevel <= level:
+                end = nidx
+                break
+        for sect in sects:
+            if sect not in found:
+                found[sect] = (idx, idx + 1, end)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# 檢查
+# ---------------------------------------------------------------------------
+
+def check_filename(path, issues):
+    name = os.path.basename(path)
+    m = RE_NAME.match(name)
+    ok = False
+    if m:
+        date, hhmm = m.group(1), m.group(2)
+        mm, dd = int(date[4:6]), int(date[6:8])
+        hh, mi = int(hhmm[0:2]), int(hhmm[2:4])
+        ok = 1 <= mm <= 12 and 1 <= dd <= 31 and hh <= 23 and mi <= 59
+    if not ok:
+        issues.append(Issue(path, 1, WARN,
+                            "檔名不符慣例 <YYYYMMDD>-<HHMM>-<worker>-<主題>.md"
+                            "(watcher 解析不出 worker,通知會標成 -)"))
+
+
+def check_sections(path, lines, issues):
+    found = section_ranges(lines)
+    for canonical, _ in SECTIONS:
+        if canonical not in found:
+            issues.append(Issue(path, 1, ERROR,
+                                "缺少「%s」這一節(四節缺一不算完成)" % canonical))
+    return found
+
+
+def check_files_section(path, lines, found, issues):
+    if "改了哪些檔" not in found:
+        return
+    idx, start, end = found["改了哪些檔"]
+    body = "\n".join(lines[start:end])
+    if not RE_FILE_LINE.search(body):
+        issues.append(Issue(path, idx + 1, WARN,
+                            "「改了哪些檔」節內沒有任何「檔案:行號」形式 —— "
+                            "只寫檔名,讀的人還是要自己找"))
+
+
+def check_verify_section(path, lines, found, issues):
+    if "怎麼驗證" not in found:
+        return
+    idx, start, end = found["怎麼驗證"]
+    body = lines[start:end]
+    has_fence = any(RE_FENCE.match(ln) for ln in body)
+    has_indent = any(RE_INDENT_BLOCK.match(ln) for ln in body)
+    if not has_fence and not has_indent:
+        issues.append(Issue(path, idx + 1, WARN,
+                            "「怎麼驗證」節內沒有 code block 也沒有縮排區塊 —— "
+                            "疑似沒貼實際指令與輸出"))
+
+
+def check_fake_signals(path, lines, issues):
+    for i, line in enumerate(lines):
+        for phrase in FAKE_SIGNALS:
+            if phrase in line:
+                issues.append(Issue(path, i + 1, WARN,
+                                    "出現假訊號用語「%s」 —— 這代表沒有真的跑過,"
+                                    "請改貼實跑輸出" % phrase))
+                break
+
+
+def lint_file(path):
+    """驗一份報告,回傳 [Issue](已依行號排序)。讀不到檔就回一筆 error。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return [Issue(path, 1, ERROR, "讀不到這個檔:%s" % exc.strerror)]
+
+    lines = text.splitlines()
+    issues = []
+    check_filename(path, issues)
+    found = check_sections(path, lines, issues)
+    check_files_section(path, lines, found, issues)
+    check_verify_section(path, lines, found, issues)
+    check_fake_signals(path, lines, issues)
+    issues.sort(key=lambda x: (x.line, 0 if x.level == ERROR else 1))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def collect_paths(args):
+    paths = list(args.files)
+    if args.all:
+        paths.extend(sorted(glob.glob(os.path.join(REPORTS, "*.md"))))
+    # 去重但保持順序
+    seen = set()
+    out = []
+    for p in paths:
+        ap = os.path.abspath(p)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        out.append(p)
+    return out
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="fleet lint",
+        description="報告四節 schema 驗證(做了什麼 / 改了哪些檔 / 怎麼驗證 / 殘留問題)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="缺節算 error(exit 1);內容可疑算 warn(預設 exit 0,加 --strict 才擋)。")
+    ap.add_argument("files", nargs="*", metavar="報告檔")
+    ap.add_argument("--all", action="store_true",
+                    help="改驗 $FLEET_REPORTS 下所有 *.md")
+    ap.add_argument("--strict", action="store_true", help="warn 也算失敗")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+
+    paths = collect_paths(args)
+    if not paths:
+        if args.all:
+            sys.stdout.write("%s 下沒有 .md 報告,沒東西可驗。\n" % REPORTS)
+            return 0
+        ap.print_usage(sys.stderr)
+        sys.stderr.write("fleet lint: 要給報告檔,或用 --all 驗整個報告目錄。\n")
+        return 2
+
+    n_error = n_warn = 0
+    n_clean = 0
+    for path in paths:
+        issues = lint_file(path)
+        if not issues:
+            n_clean += 1
+        for it in issues:
+            sys.stdout.write(it.format() + "\n")
+            if it.level == ERROR:
+                n_error += 1
+            else:
+                n_warn += 1
+
+    sys.stdout.write("檢查 %d 份報告:%d error、%d warn,%d 份完全乾淨。\n"
+                     % (len(paths), n_error, n_warn, n_clean))
+    if n_error:
+        return 1
+    if args.strict and n_warn:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

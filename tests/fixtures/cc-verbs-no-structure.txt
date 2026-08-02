@@ -1,0 +1,24 @@
+# 來源:手工構造(回歸測試專用)。
+#
+# 這個檔存在的唯一目的:釘住「**busy 判定不可依賴 spinner 動詞**」。
+# claude CLI 的 spinner 動詞是隨機生成的(Metamorphosing / Boondoggling /
+# Razzmatazzing / Levitating…),抓字必漏;漏了就把正在幹活的 worker
+# 誤報成閒置 → 狂發假警報,而假警報比沒警報更糟。
+#
+# 畫面上滿滿都是動詞,但**沒有任何結構性訊號**(沒有計時器、沒有 token 計數、
+# 沒有中斷提示)。斷言:這個檔**不**可被判成 busy。
+# 如果哪天有人把動詞加回 adapters/cc.conf 的 busy,這條會立刻變紅。
+
+⏺ Metamorphosing…
+
+⏺ Razzmatazzing…
+
+⏺ Boondoggling…
+
+⏺ Levitating…
+
+──────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────
+   ✱ Opus 5  ~/w/demo  ◆ 4  ◔ 70%
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

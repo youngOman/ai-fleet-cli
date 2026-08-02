@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+# fleet — tmux 多 agent 派工台
+#
+# 一個「指揮官 AI」用來把工作即時派給 worker(claude / codex)的工具,
+# worker 完工把報告寫進共用目錄,背景 watcher 偵測到就自動把短訊注入
+# 指揮官的輸入框把人叫醒——解決「AI 做完不會叫人、指揮官掛機空等」。
+#
+# worker 有兩種來源,都用同一個 id 定址:
+#   1. adopt — 接管你已經開好的 pane(不用重開,也永遠不會被 kill)
+#   2. spawn — fleet up / add 在專屬 socket 新開,與日常 session 隔離
+#
+# 完整說明見 README.md;踩過的坑見 docs/pitfalls.md(改動送訊流程前務必先讀)。
+
+set -uo pipefail
+
+FLEET_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# 定位自己(可能是透過 symlink 被呼叫的)
+# ---------------------------------------------------------------------------
+# 注意:這裡刻意不用 case 判斷絕對路徑。bash 3.2 在 $( ) 裡解析 case 的 `)`
+# 會誤判成命令替換結尾(macOS 內建 /bin/bash 就是 3.2),改用 ${p#/} 比對。
+_bin_dir=$(
+  p="$0"
+  while [ -L "$p" ]; do
+    d=$(cd -P "$(dirname "$p")" >/dev/null 2>&1 && pwd) || exit 1
+    p=$(readlink "$p")
+    if [ "${p#/}" = "$p" ]; then p="$d/$p"; fi
+  done
+  cd -P "$(dirname "$p")" >/dev/null 2>&1 && pwd
+) || { echo "fleet: 無法定位自身路徑" >&2; exit 1; }
+FLEET_LIBDIR=${FLEET_LIBDIR:-$(cd -P "$_bin_dir/.." && pwd)}
+export FLEET_LIBDIR
+
+for _f in core registry signals tmuxio; do
+  if [ ! -f "$FLEET_LIBDIR/lib/$_f.sh" ]; then
+    echo "fleet: 找不到 $FLEET_LIBDIR/lib/$_f.sh — 安裝不完整?試試重跑 install.sh" >&2
+    exit 1
+  fi
+done
+# shellcheck source=lib/core.sh
+. "$FLEET_LIBDIR/lib/core.sh"
+
+# 記下「載入設定檔之前就已存在的 FLEET_ 變數」,fleet config 用它區分來源
+_FLEET_PREENV=$(env | grep '^FLEET_' | cut -d= -f1 | tr '\n' ' ')
+
+fleet_load_config
+fleet_init_paths
+fleet_ensure_dirs || fleet_die "無法建立 $FLEET_PROFILE_DIR — 檢查權限"
+
+# shellcheck source=lib/registry.sh
+. "$FLEET_LIBDIR/lib/registry.sh"
+# shellcheck source=lib/signals.sh
+. "$FLEET_LIBDIR/lib/signals.sh"
+# shellcheck source=lib/tmuxio.sh
+. "$FLEET_LIBDIR/lib/tmuxio.sh"
+
+LIBEXEC="$FLEET_LIBDIR/libexec"
+
+# ---------------------------------------------------------------------------
+# adopt / discover
+# ---------------------------------------------------------------------------
+
+cmd_discover() {
+  fleet_info "掃描現有 pane:"
+  local tmp sock pane content kind cwd n=0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/fleet.XXXXXX") || return 1
+  for sock in "-" "$FLEET_SOCKET"; do
+    while read -r pane; do
+      [ -n "$pane" ] || continue
+      content=$(stmux "$sock" capture-pane -p -t "$pane" 2>/dev/null || true)
+      kind=$(detect_kind "$content") || continue
+      cwd=$(stmux "$sock" display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)
+      printf '%s\t%s\t%s\t%s\n' "$sock" "$pane" "$kind" "$cwd" >> "$tmp"
+    done <<EOF
+$(stmux "$sock" list-panes -a -F '#{pane_id}' 2>/dev/null)
+EOF
+  done
+
+  if [ ! -s "$tmp" ]; then
+    fleet_info "  (沒找到任何 worker CLI 的 pane;支援的種類:$(signals_kinds | tr '\n' ' '))"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  printf '%s  %-4s %-8s %-30s %s%s\n' "$c_dim" "型" "pane" "目錄(用這個認)" "建議接管指令" "$c_rst"
+  local sid disp
+  while IFS=$'\t' read -r sock pane kind cwd; do
+    n=$((n + 1))
+    sid="${kind}${n}"
+    while reg_get "$sid" >/dev/null 2>&1; do
+      n=$((n + 1))
+      sid="${kind}${n}"
+    done
+    disp=$(fleet_tildify "$cwd")
+    printf '  %s%-4s%s %-8s %-30s %sfleet adopt %s %s %s%s\n' \
+      "$c_ylw" "$kind" "$c_rst" "$pane" "$(printf '%s' "$disp" | cut -c1-30)" \
+      "$c_grn" "$sid" "$pane" "$sock" "$c_rst"
+  done < "$tmp"
+  rm -f "$tmp"
+  printf '%s  提示:id 換成專案名更好認,例如 fleet adopt linkmind %%12 -%s\n' "$c_dim" "$c_rst"
+}
+
+cmd_adopt() {
+  local id=${1:-} pane=${2:-} sock=${3:--} kind
+  [ -n "$id" ] && [ -n "$pane" ] \
+    || fleet_die "用法:fleet adopt <id> <%NN> [socket]  (socket 省略=你日常那個)"
+  valid_id "$id" || fleet_die "id 只能用英數 _ -"
+  valid_pane "$pane" \
+    || fleet_die "pane 要是 %NN 形式(在該 pane 跑 tmux display -p '#{pane_id}' 可查)。座標會位移,不接受。"
+  valid_socket "$sock" || fleet_die "socket 名怪異,拒絕"
+  pane_exists "$sock" "$pane" || fleet_die "找不到 pane $pane(socket=$sock)"
+  kind=$(detect_kind "$(stmux "$sock" capture-pane -p -t "$pane" 2>/dev/null)") || kind='?'
+  reg_add "$id" "$sock" "$pane" "$kind" || fleet_die "寫入 registry 失敗"
+  fleet_info "已接管 $id → $pane(socket=$sock,類型=$kind)。這是你既有的 pane,fleet 只會派工/讀畫面,永不 kill。"
+  [ "$kind" = '?' ] && fleet_warn "  這個 pane 看起來不像任何已知的 worker CLI,派工前確認一下。"
+  return 0
+}
+
+cmd_forget() {
+  local id=${1:-}
+  [ -n "$id" ] || fleet_die "用法:fleet forget <id>"
+  reg_get "$id" >/dev/null 2>&1 || fleet_die "沒有登記 $id"
+  reg_del "$id" && fleet_info "已移除登記 $id(pane 本身沒動)。"
+}
+
+cmd_rename() {
+  local old=${1:-} new=${2:-} line
+  [ -n "$old" ] && [ -n "$new" ] || fleet_die "用法:fleet rename <舊id> <新id>"
+  valid_id "$new" || fleet_die "新 id 只能用英數 _ -"
+  reg_get "$old" >/dev/null 2>&1 || fleet_die "沒有登記 $old"
+  reg_get "$new" >/dev/null 2>&1 && fleet_die "$new 已存在,換一個"
+  line=$(reg_get "$old")
+  reg_add "$new" "$(printf '%s' "$line" | cut -f2)" \
+    "$(printf '%s' "$line" | cut -f3)" "$(printf '%s' "$line" | cut -f4)" || return 1
+  reg_del "$old"
+  fleet_info "已改名:$old → $new"
+}
+
+cmd_who() {
+  local id=${1:-} pane sock
+  [ -n "$id" ] || fleet_die "用法:fleet who <id>"
+  require_worker "$id"
+  pane=$(wpane "$id"); sock=$(wsocket "$id")
+  printf '%s[%s]%s  socket=%s  pane=%s\n' "$c_cyn" "$id" "$c_rst" "$sock" "$pane"
+  stmux "$sock" display-message -p -t "$pane" \
+    '  session=#{session_name}  window=#{window_index}(#{window_name})  tty=#{pane_tty}
+  目錄=#{pane_current_path}' 2>/dev/null || true
+  # 只碰狀態列,不會打進 REPL
+  stmux "$sock" display-message -t "$pane" -d 5000 "👈 fleet: 這個 pane 是 [$id]" 2>/dev/null || true
+  printf '%s  (已在該 session 狀態列閃出 [%s])畫面末 8 行:%s\n' "$c_dim" "$id" "$c_rst"
+  pane_capture "$sock" "$pane" | sed '/^[[:space:]]*$/d' | tail -8
+}
+
+# ---------------------------------------------------------------------------
+# spawn
+# ---------------------------------------------------------------------------
+
+wait_ready() {  # <socket> <pane> <kind>
+  local sock=$1 pane=$2 kind=$3 i=0 scr
+  while [ "$i" -lt 80 ]; do
+    scr=$(stmux "$sock" capture-pane -p -t "$pane" 2>/dev/null || true)
+    if pane_trust "$kind" "$scr"; then
+      stmux "$sock" send-keys -t "$pane" Enter
+      sleep 0.6
+      i=$((i + 1))
+      continue
+    fi
+    pane_ready "$kind" "$scr" && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+next_id() {
+  local k=$1 n=1
+  while reg_get "${k}${n}" >/dev/null 2>&1; do n=$((n + 1)); done
+  printf '%s' "${k}${n}"
+}
+
+spawn_worker() {
+  local id=$1 kind=$2 dir=$3 cmd pane
+  cmd=$(signals_get "$kind" command)
+  [ -n "$cmd" ] || { fleet_err "adapters/$kind.conf 沒有定義 command"; return 1; }
+  # -P -F 取回**穩定 pane id**。舊版登記 session:window 名稱,window 改名或重排就送錯人。
+  pane=$(tmux -L "$FLEET_SOCKET" new-window -t "$FLEET_SESSION" -n "$id" -c "$dir" -P -F '#{pane_id}') \
+    || { fleet_err "$id: 開 window 失敗"; return 1; }
+  tmux -L "$FLEET_SOCKET" send-keys -t "$pane" "$cmd" Enter
+  printf '  %s%-6s%s %-8s %s ... ' "$c_ylw" "$id" "$c_rst" "$cmd" "$dir"
+  if wait_ready "$FLEET_SOCKET" "$pane" "$kind"; then
+    reg_add "$id" "$FLEET_SOCKET" "$pane" "$kind"
+    printf '%sready%s (%s)\n' "$c_grn" "$c_rst" "$pane"
+  else
+    reg_add "$id" "$FLEET_SOCKET" "$pane" "$kind"
+    printf '%s逾時%s (%s;tmux -L %s attach 看看)\n' "$c_red" "$c_rst" "$pane" "$FLEET_SOCKET"
+  fi
+}
+
+cmd_up() {
+  local nc=2 nx=1 dir="$FLEET_DEFAULT_DIR" i
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cc) nc=$2; shift 2 ;;
+      --cx) nx=$2; shift 2 ;;
+      -C | --dir) dir=$2; shift 2 ;;
+      *) fleet_die "up: 未知參數 $1" ;;
+    esac
+  done
+  [ -d "$dir" ] || fleet_die "工作目錄不存在:$dir"
+  tmux -L "$FLEET_SOCKET" has-session -t "$FLEET_SESSION" 2>/dev/null \
+    && fleet_die "已有 spawn 出來的艦隊在跑。用 fleet add 增援,或 fleet down 收掉重建。"
+  fleet_info "新開艦隊(socket=$FLEET_SOCKET,目錄=$dir)"
+  tmux -L "$FLEET_SOCKET" new-session -d -s "$FLEET_SESSION" -n commander -c "$dir" -x 220 -y 55
+  [ "$nc" -gt 0 ] && for i in $(seq 1 "$nc"); do spawn_worker "$(next_id cc)" cc "$dir"; done
+  [ "$nx" -gt 0 ] && for i in $(seq 1 "$nx"); do spawn_worker "$(next_id cx)" cx "$dir"; done
+  echo
+  fleet_info "完成。fleet ls 看清單。"
+}
+
+cmd_add() {
+  local kind=${1:-} dir=${2:-$FLEET_DEFAULT_DIR}
+  [ -n "$kind" ] || fleet_die "用法:fleet add <kind> [目錄];可用的 kind:$(signals_kinds | tr '\n' ' ')"
+  signals_load "$kind" || fleet_die "沒有 adapters/$kind.conf;可用的 kind:$(signals_kinds | tr '\n' ' ')"
+  tmux -L "$FLEET_SOCKET" has-session -t "$FLEET_SESSION" 2>/dev/null \
+    || tmux -L "$FLEET_SOCKET" new-session -d -s "$FLEET_SESSION" -n commander -c "$dir" -x 220 -y 55
+  spawn_worker "$(next_id "$kind")" "$kind" "$dir"
+}
+
+cmd_attach() {
+  if tmux -L "$FLEET_SOCKET" has-session -t "$FLEET_SESSION" 2>/dev/null; then
+    [ -n "${TMUX:-}" ] \
+      && fleet_die "你已在 tmux 裡。用獨立終端:tmux -L $FLEET_SOCKET attach -t $FLEET_SESSION"
+    tmux -L "$FLEET_SOCKET" attach -t "$FLEET_SESSION"
+  else
+    fleet_info "沒有 spawn 出來的艦隊;接管的 pane 就在你原本的 session 裡,直接切過去看即可。"
+  fi
+}
+
+cmd_down() {
+  local yes=0 spawned adopted ans id
+  case "${1:-}" in -y | --yes) yes=1 ;; esac
+  spawned=$(awk -F'\t' -v s="$FLEET_SOCKET" '$2==s{n++} END{print n+0}' "$FLEET_REG")
+  adopted=$(awk -F'\t' -v s="$FLEET_SOCKET" '$2!=s{n++} END{print n+0}' "$FLEET_REG")
+  if [ "$yes" != 1 ]; then
+    printf '%s即將:kill 掉 %s 個新開的 worker;放掉(不 kill)%s 個接管的既有 pane。確定?[y/N] %s' \
+      "$c_ylw" "$spawned" "$adopted" "$c_rst"
+    read -r ans || ans=""
+    case "$ans" in y | Y) ;; *) fleet_info "取消。"; return 0 ;; esac
+  fi
+  tmux -L "$FLEET_SOCKET" kill-server 2>/dev/null || true
+  # 只清掉 spawn 出來的登記;接管的留著(pane 還活著)
+  for id in $(awk -F'\t' -v s="$FLEET_SOCKET" '$2==s{print $1}' "$FLEET_REG"); do
+    reg_del "$id"
+  done
+  fleet_info "已收:新開的 worker 已 kill,接管的 pane 沒動、登記也還在。"
+}
+
+# ---------------------------------------------------------------------------
+# 看板 / 派工 / 讀回報
+# ---------------------------------------------------------------------------
+
+cmd_ls() {
+  local ids id sock pane kind alive cwd
+  ids=$(reg_ids)
+  [ -n "$ids" ] || { fleet_info "還沒有 worker。fleet discover 找現有 pane,或 fleet up 新開。"; return 0; }
+  printf '%s  %-12s %-4s %-8s %-8s %-4s %s%s\n' "$c_dim" "ID" "型" "socket" "pane" "活" "目錄" "$c_rst"
+  for id in $ids; do
+    sock=$(wsocket "$id"); pane=$(wpane "$id"); kind=$(wkind "$id")
+    if pane_alive "$id"; then
+      alive="${c_grn}yes${c_rst}"
+      cwd=$(stmux "$sock" display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)
+      cwd=$(fleet_tildify "$cwd")
+    else
+      alive="${c_red}NO ${c_rst}"
+      cwd="(pane 已消失,可 fleet forget $id)"
+    fi
+    printf '  %s%-12s%s %-4s %-8s %-8s %-4b %s%s%s\n' \
+      "$c_ylw" "$id" "$c_rst" "$kind" "$sock" "$pane" "$alive" "$c_dim" "$cwd" "$c_rst"
+  done
+}
+
+cmd_send() {
+  local id=${1:-} text
+  [ -n "$id" ] || fleet_die "用法:fleet send <id> \"文字\"   或   fleet send <id> < ticket.txt"
+  shift
+  require_worker "$id"
+  if [ $# -gt 0 ]; then text="$*"; else text=$(cat); fi
+  [ -n "${text//[[:space:]]/}" ] || fleet_die "派工內容是空的"
+  send_plain "$(wsocket "$id")" "$(wpane "$id")" "$text" \
+    || fleet_die "送訊失敗($id)"
+  fleet_info "→ 已送給 $id($(printf '%s' "$text" | head -1 | cut -c1-48)…)"
+  fleet_warn "  送出 ≠ 有在跑。長訊息可能卡在輸入框而指令仍回報成功;用 fleet peek $id 確認。"
+}
+
+cmd_bcast() {
+  local text id
+  if [ $# -gt 0 ]; then text="$*"; else text=$(cat); fi
+  for id in $(reg_ids); do
+    printf '%s' "$text" | cmd_send "$id"
+  done
+}
+
+# 派正式任務。
+# 為何送短訊指向檔案而不是直接送長文:worker 收長訊息會卡在輸入框顯示
+# [Pasted Content NNNN chars] 卻不執行,而送訊指令仍回報「已派給」——假訊號。
+cmd_task() {
+  local id=${1:-} brief=${2:-} stamp rp
+  [ -n "$id" ] && [ -n "$brief" ] || fleet_die "用法:fleet task <id> <brief檔或名稱>"
+  if [ ! -f "$brief" ]; then
+    if [ -f "$FLEET_TASKS/$brief" ]; then
+      brief="$FLEET_TASKS/$brief"
+    elif [ -f "$FLEET_TASKS/$brief.md" ]; then
+      brief="$FLEET_TASKS/$brief.md"
+    else
+      fleet_die "找不到派工單:$brief(也試過 $FLEET_TASKS/${brief} 與 ${brief}.md)"
+    fi
+  fi
+  require_worker "$id"
+  stamp=$(date +%Y%m%d-%H%M)
+  rp="$FLEET_REPORTS/${stamp}-${id}-<主題>.md"
+  send_plain "$(wsocket "$id")" "$(wpane "$id")" \
+    "讀 ${brief} 並開工。完成後把報告寫到 ${rp}(四節:做了什麼／改了哪些檔含 檔案:行號／怎麼驗證並貼實際輸出／殘留問題)。寫完不用特地通知我,艦隊 watcher 會自動叫我;畫面留一句「報告已寫到 <路徑>」即可。" \
+    || fleet_die "送訊失敗($id)"
+  fleet_info "→ 已派工給 $id:$brief"
+  fleet_warn "  務必 fleet peek $id 確認它真的動了(codex 收長訊可能卡在輸入框)。"
+}
+
+cmd_peek() {
+  local id=${1:-} lines=${2:-40}
+  [ -n "$id" ] || fleet_die "用法:fleet peek <id> [行數]"
+  require_worker "$id"
+  printf '%s──── %s(末 %s 行)────%s\n' "$c_cyn" "$id" "$lines" "$c_rst"
+  pane_capture "$(wsocket "$id")" "$(wpane "$id")" "$lines" | sed '/^[[:space:]]*$/d'
+}
+
+cmd_wait() {
+  local id=${1:-} max=${2:-300} i=0 kind sock pane scr
+  [ -n "$id" ] || fleet_die "用法:fleet wait <id> [秒]"
+  require_worker "$id"
+  kind=$(wkind "$id"); sock=$(wsocket "$id"); pane=$(wpane "$id")
+  while [ "$i" -lt "$max" ]; do
+    scr=$(pane_capture "$sock" "$pane" 60)
+    # 用 adapter 的 busy 訊號,跟 watcher / 看板同一份規則。
+    # 舊版這裡自己抓 spinner 動詞,會把正在幹活的 worker 誤判成 idle。
+    pane_busy "$kind" "$scr" || { fleet_info "$id 看起來 idle 了"; return 0; }
+    sleep 2
+    i=$((i + 2))
+  done
+  fleet_err "$id 等超過 ${max}s 仍在忙"
+  return 1
+}
+
+cmd_reports() {
+  local n=${1:-10} f
+  mkdir -p "$FLEET_REPORTS"
+  printf '%s最近 %s 份報告(%s)%s\n' "$c_cyn" "$n" "$FLEET_REPORTS" "$c_rst"
+  ls -1t "$FLEET_REPORTS"/*.md 2>/dev/null | head -"$n" | while read -r f; do
+    printf '  %s  %s\n' "$(date -r "$f" '+%m/%d %H:%M' 2>/dev/null || echo '     ')" "$(basename "$f")"
+  done
+  ls -1 "$FLEET_REPORTS"/*.md >/dev/null 2>&1 || printf '%s  (還沒有報告)%s\n' "$c_dim" "$c_rst"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 指揮官 / profile / 設定 / 維運
+# ---------------------------------------------------------------------------
+
+cmd_commander() {
+  local pane=${1:-} sock=${2:--}
+  if [ -z "$pane" ]; then
+    if [ -f "$FLEET_COMMANDER_FILE" ]; then
+      printf '指揮官:socket=%s pane=%s' "$(commander_socket)" "$(commander_pane)"
+      if pane_exists "$(commander_socket)" "$(commander_pane)"; then
+        printf '  %s(存活)%s\n' "$c_grn" "$c_rst"
+      else
+        printf '  %s(pane 不存在!通知會全部送不到)%s\n' "$c_red" "$c_rst"
+      fi
+    else
+      fleet_warn "還沒設定指揮官。在指揮官那個 pane 裡跑:"
+      printf '    tmux display -p "#{pane_id}"\n'
+      printf '  再把結果餵進來:\n'
+      printf '    fleet commander %%NN\n'
+      return 1
+    fi
+    return 0
+  fi
+  commander_set "$pane" "$sock" || return 1
+  fleet_info "指揮官已設定:socket=$sock pane=$pane"
+}
+
+cmd_profile() {
+  local name=${1:-} d
+  if [ -z "$name" ]; then
+    printf '%s目前 profile:%s%s\n' "$c_cyn" "$FLEET_PROFILE" "$c_rst"
+    printf '%s可用的:%s\n' "$c_dim" "$c_rst"
+    for d in "$FLEET_HOME"/profiles/*/; do
+      [ -d "$d" ] || continue
+      printf '  %s\n' "$(basename "$d")"
+    done
+    printf '%s切換方式:export FLEET_PROFILE=<名稱>(每個 profile 有自己的 registry / 指揮官 / watcher)%s\n' "$c_dim" "$c_rst"
+    return 0
+  fi
+  printf '%s' "$name" | grep -qE '^[A-Za-z0-9_-]+$' || fleet_die "profile 名只能用英數 _ -"
+  mkdir -p "$FLEET_HOME/profiles/$name"
+  fleet_info "profile「${name}」已就緒。用這行切過去:"
+  printf '    export FLEET_PROFILE=%s\n' "$name"
+}
+
+cmd_config() {
+  local v src val
+  printf '%s生效中的設定%s\n' "$c_cyn" "$c_rst"
+  printf '  設定檔:%s%s\n' "$(fleet_config_path)" \
+    "$([ -f "$(fleet_config_path)" ] && echo '' || echo '(不存在)')"
+  echo
+  for v in FLEET_HOME FLEET_PROFILE FLEET_REPORTS FLEET_TASKS FLEET_DEFAULT_DIR \
+           FLEET_SOCKET FLEET_SESSION FLEET_SEND_DELAY FLEET_POLL_SECS \
+           FLEET_STABLE_SECS FLEET_IDLE_SECS FLEET_STUCK_SECS \
+           FLEET_QUIET_AFTER_REPORT FLEET_BACKFILL_SECS FLEET_MAX_ATTEMPTS \
+           FLEET_LINT_REPORTS; do
+    eval "val=\${$v:-}"
+    case " $_FLEET_PREENV " in
+      *" $v "*) src="環境變數" ;;
+      *)
+        if [ -f "$(fleet_config_path)" ] && grep -qE "^[[:space:]]*$v=" "$(fleet_config_path)"; then
+          src="設定檔"
+        else
+          src="預設"
+        fi
+        ;;
+    esac
+    printf '  %-24s %-40s %s%s%s\n' "$v" "$val" "$c_dim" "$src" "$c_rst"
+  done
+  # 這兩行的標籤含中文,printf 的 %-Ns 是按位元組補齊、不是按顯示寬度,
+  # 用寬度對齊只會歪掉,所以直接冒號接值。
+  echo
+  printf '  profile 目錄:%s\n' "$FLEET_PROFILE_DIR"
+  printf '  adapters:%s\n' "$(signals_kinds | tr '\n' ' ')"
+}
+
+cmd_gc() {
+  "$LIBEXEC/fleet-state" gc --state "$FLEET_STATE_FILE" \
+    --dir "$FLEET_REPORTS" --ids "$(reg_ids | tr '\n' ' ')"
+}
+
+cmd_version() {
+  printf 'fleet %s\n' "$FLEET_VERSION"
+  printf '  安裝於  %s\n' "$FLEET_LIBDIR"
+  printf '  profile %s (%s)\n' "$FLEET_PROFILE" "$FLEET_PROFILE_DIR"
+}
+
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+${c_cyn}fleet${c_rst} — tmux 多 agent 派工台  (v$FLEET_VERSION)
+
+${c_grn}接管既有 pane(推薦,不用重開)${c_rst}
+  fleet discover                       掃現有 worker pane,列出接管指令
+  fleet adopt <id> <%NN> [socket]      接管一個既有 pane(永不 kill)
+  fleet who <id>                       這個 id 是哪個視窗?並在該 session 狀態列閃提示
+  fleet rename <舊> <新>               改成看得懂的名字
+  fleet forget <id>                    解除登記(不 kill pane)
+
+${c_grn}新開 worker(獨立 socket:$FLEET_SOCKET)${c_rst}
+  fleet up [--cc N] [--cx M] [-C dir]  預設 2 claude + 1 codex
+  fleet add <kind> [dir]               動態增援一個
+  fleet attach                         進去看
+  fleet down [-y]                      收攤:kill 新開的、放掉接管的
+
+${c_grn}回報閉環(worker 做完自動叫醒指揮官)${c_rst}
+  fleet commander [<%NN>] [socket]     設定／顯示指揮官 pane
+  fleet watch start|stop|restart|status|log
+  fleet task <id> <brief>              派正式任務(送短訊指向 brief,自動附回報協定)
+  fleet reports [N]                    列最近 N 份報告
+  fleet lint <報告檔>                  報告四節驗證
+
+${c_grn}派工 / 觀察${c_rst}
+  fleet                                即時看板(不帶參數的預設動作)
+  fleet mon [-w]                       看板;-w 持續刷新(需真 TTY)
+  fleet ls                             registry 清單
+  fleet send <id> "文字"               送訊息(也可從 stdin)
+  fleet bcast "文字"                   廣播
+  fleet peek <id> [行數]               讀 worker 畫面
+  fleet wait <id> [秒]                 等 worker 回到 idle
+
+${c_grn}維運${c_rst}
+  fleet doctor                         健檢
+  fleet config                         顯示生效中的設定與來源
+  fleet profile [<名稱>]               列出／建立艦隊 profile
+  fleet gc                             清理狀態檔裡的孤兒記錄
+  fleet version
+
+踩過的坑與為什麼這樣設計:$FLEET_LIBDIR/docs/pitfalls.md
+EOF
+}
+
+run_libexec() {
+  local prog=$1
+  shift
+  [ -x "$LIBEXEC/$prog" ] || fleet_die "找不到 $LIBEXEC/$prog — 安裝不完整?"
+  exec "$LIBEXEC/$prog" "$@"
+}
+
+main() {
+  local sub=${1:-}
+  shift 2>/dev/null || true
+  case "$sub" in
+    discover | scan) cmd_discover "$@" ;;
+    adopt) cmd_adopt "$@" ;;
+    forget) cmd_forget "$@" ;;
+    rename | mv) cmd_rename "$@" ;;
+    who | find) cmd_who "$@" ;;
+    up) cmd_up "$@" ;;
+    add) cmd_add "$@" ;;
+    attach) cmd_attach "$@" ;;
+    down | kill) cmd_down "$@" ;;
+    ls | list) cmd_ls "$@" ;;
+    send | dispatch) cmd_send "$@" ;;
+    bcast | broadcast) cmd_bcast "$@" ;;
+    task) cmd_task "$@" ;;
+    peek | read) cmd_peek "$@" ;;
+    wait) cmd_wait "$@" ;;
+    reports) cmd_reports "$@" ;;
+    commander) cmd_commander "$@" ;;
+    profile) cmd_profile "$@" ;;
+    config) cmd_config "$@" ;;
+    gc) cmd_gc "$@" ;;
+    version | --version | -V) cmd_version ;;
+    watch) run_libexec fleet-watcher "$@" ;;
+    doctor) run_libexec fleet-doctor "$@" ;;
+    lint) run_libexec fleet-lint "$@" ;;
+    mon | m | st | status) run_libexec fleet-mon "$@" ;;
+    -w | --watch) run_libexec fleet-mon -w "$@" ;;
+    "") run_libexec fleet-mon --once ;;
+    -h | --help | help) usage ;;
+    *) fleet_err "未知子命令:$sub"; echo; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

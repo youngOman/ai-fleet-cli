@@ -1,0 +1,20 @@
+# 來源:手工構造。錄製當下兩個 codex worker 都已收工,錄不到忙碌畫面;
+# 依 adapters/cx.conf 的 busy regex 與 cx-idle.txt 的真實外殼組出來。
+#
+# 注意大小寫:codex 的中斷提示第一個字母是大寫,而 adapters/cc.conf 的 detect
+# 只收小寫那一種。這是刻意的——大小寫一放寬,忙碌中的 codex 就會被 detect_kind
+# 認成 claude,整組 regex 都套錯人。所以這個檔同時也是 detect_kind 的分界測試。
+
+• Ran 佔位命令
+  │ 佔位輸出第一行
+  │ … +8 lines
+
+────────────────────────────────────────────────────
+
+• 正在往下查。
+
+  Esc to interrupt · (3m 12s)
+
+›
+
+  gpt-5.6-sol high · ~/w/demo

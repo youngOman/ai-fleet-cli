@@ -1,0 +1,711 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# fleet-doctor — 環境健檢
+# ---------------------------------------------------------------------------
+#
+# 由 `fleet doctor` 用 exec 叫起(此時環境已有全部 FLEET_* 與 FLEET_LIBDIR),
+# 也可以單獨執行:
+#     FLEET_HOME=/tmp/x bash libexec/fleet-doctor
+#
+# 相容目標:bash 3.2(macOS 內建)。不用關聯陣列、${var,,}、mapfile。
+#
+# ⚠ bash 3.2 的中文坑:變數展開後面**直接**接非 ASCII 字元(例如 $ 加 name 再接「」),
+#   在 set -u 下直接噴 `var\xe5: unbound variable` 整支腳本當場死掉。
+#   **變數後面只要接非 ASCII 字元,一律寫成 `${var}中文`。**
+#
+# 設計原則
+# --------
+# 1. **只檢查這個環境真的會用到的東西**。registry 裡沒有 cx worker 就不去看
+#    codex CLI 裝了沒——檢查使用者根本不需要的東西只會製造假失敗,
+#    假失敗看多了整份健檢就沒人信了。
+# 2. **失敗訊息要是可直接複製的指令**,不是 PASS/FAIL。使用者跑 doctor
+#    是因為東西壞了,他要的是「貼這行」不是「你失敗了」。
+# 3. **分清「診斷不出來」與「診斷出壞掉」**。tmux server 沒跑的時候
+#    驗不了 pane 存活,那是 ⚠(資訊不足)不是 ✗(確定壞了)。
+#    把不確定報成壞掉,會逼使用者去 forget 其實還活著的 worker。
+# 4. 離開碼 = ✗ 的項數(0 = 全過)。⚠ 不計入,這樣 CI 可以直接用。
+# ---------------------------------------------------------------------------
+
+set -u
+
+# ---------------------------------------------------------------------------
+# 找到自己 → 找到 lib/
+# ---------------------------------------------------------------------------
+# 與 lib/core.sh 的 fleet_resolve_dir 同一套演算法。這裡必須內嵌一份:
+# 要先知道自己在哪才 source 得到 core.sh(雞生蛋)。之後的路徑推導
+# 一律交給 core.sh,不在這裡重寫。
+
+_doctor_self_dir() {
+  local p=$1 d
+  while [ -L "$p" ]; do
+    d=$(cd -P "$(dirname "$p")" >/dev/null 2>&1 && pwd) || return 1
+    p=$(readlink "$p") || return 1
+    case "$p" in
+      /*) ;;
+      *) p="$d/$p" ;;
+    esac
+  done
+  cd -P "$(dirname "$p")" >/dev/null 2>&1 && pwd
+}
+
+if [ -z "${FLEET_LIBDIR:-}" ]; then
+  _self=$(_doctor_self_dir "$0") || {
+    printf 'fleet doctor: 無法定位自己的位置\n' >&2
+    exit 1
+  }
+  FLEET_LIBDIR=$(cd -P "$_self/.." >/dev/null 2>&1 && pwd) || {
+    printf 'fleet doctor: 無法推導 FLEET_LIBDIR\n' >&2
+    exit 1
+  }
+fi
+export FLEET_LIBDIR
+
+if [ ! -f "$FLEET_LIBDIR/lib/core.sh" ]; then
+  printf 'fleet doctor: 找不到 %s/lib/core.sh(安裝不完整?)\n' "$FLEET_LIBDIR" >&2
+  exit 1
+fi
+
+# shellcheck source=lib/core.sh
+. "$FLEET_LIBDIR/lib/core.sh"
+
+# bin/fleet 已經載過設定就不要再載一次:config.env 若有壞行,
+# fleet_load_config 每次都會把警告再印一遍,使用者會看到重複的雜訊。
+# FLEET_PROFILE_DIR 是 fleet_init_paths 才會 export 的,拿來當「載過了」的標記。
+if [ -z "${FLEET_PROFILE_DIR:-}" ] || [ -z "${FLEET_REG:-}" ]; then
+  fleet_load_config
+  fleet_init_paths
+fi
+
+# shellcheck source=lib/registry.sh
+. "$FLEET_LIBDIR/lib/registry.sh"
+
+FLEET_ADAPTER_DIR="${FLEET_ADAPTER_DIR:-$FLEET_LIBDIR/adapters}"
+export FLEET_ADAPTER_DIR
+# shellcheck source=lib/signals.sh
+. "$FLEET_LIBDIR/lib/signals.sh"
+
+# ---------------------------------------------------------------------------
+# 三態輸出
+# ---------------------------------------------------------------------------
+
+FAILS=0
+WARNS=0
+
+# 顏色由 core.sh 的 fleet_init_colors 設定;這裡補上預設值,
+# 讓這個檔在 set -u 下單獨執行時也不會炸(順便讓 shellcheck 看得到來源)。
+: "${c_red:=}" "${c_grn:=}" "${c_ylw:=}" "${c_cyn:=}" "${c_dim:=}" "${c_rst:=}"
+
+ok()   { printf '%s✓%s %s\n' "$c_grn" "$c_rst" "$*"; }
+bad()  { printf '%s✗%s %s\n' "$c_red" "$c_rst" "$*"; FAILS=$((FAILS + 1)); }
+sus()  { printf '%s⚠%s %s\n' "$c_ylw" "$c_rst" "$*"; WARNS=$((WARNS + 1)); }
+note() { printf '%sℹ%s %s\n' "$c_cyn" "$c_rst" "$*"; }
+hint() { printf '    %s%s%s\n' "$c_dim" "$*" "$c_rst"; }
+cmd()  { printf '    %s\n' "$*"; }
+
+# 家目錄縮寫,只為了輸出好讀。實作在 core.sh(fleet_tildify),不在這裡重寫。
+tilde() { fleet_tildify "$1"; }
+
+# ---------------------------------------------------------------------------
+# 平台相關的安裝指令(只在真的缺東西時才印)
+# ---------------------------------------------------------------------------
+
+pkg_hint() {
+  local pkg=$1
+  if command -v brew >/dev/null 2>&1; then
+    printf 'brew install %s' "$pkg"
+  elif command -v apt-get >/dev/null 2>&1; then
+    printf 'sudo apt-get install -y %s' "$pkg"
+  elif command -v dnf >/dev/null 2>&1; then
+    printf 'sudo dnf install -y %s' "$pkg"
+  elif command -v pacman >/dev/null 2>&1; then
+    printf 'sudo pacman -S --needed %s' "$pkg"
+  else
+    printf '請用你的套件管理器安裝 %s' "$pkg"
+  fi
+}
+
+ver_ge() {
+  if [ "$1" -gt "$3" ]; then return 0; fi
+  if [ "$1" -eq "$3" ] && [ "$2" -ge "$4" ]; then return 0; fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# 1. tmux
+# ---------------------------------------------------------------------------
+
+check_tmux() {
+  local v major minor
+  if ! command -v tmux >/dev/null 2>&1; then
+    bad "找不到 tmux → 整套 fleet 都靠它"
+    cmd "$(pkg_hint tmux)"
+    return
+  fi
+  v=$(tmux -V 2>/dev/null | sed -n 's/^tmux[^0-9]*\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+  if [ -z "$v" ]; then
+    sus "tmux 版本字串看不懂($(tmux -V 2>&1)),無法確認是否 ≥ 3.0"
+    return
+  fi
+  major=${v% *}
+  minor=${v#* }
+  if ver_ge "$major" "$minor" 3 0; then
+    ok "tmux $(tmux -V 2>/dev/null | sed 's/^tmux //')"
+  else
+    bad "tmux 版本過舊($major.$minor)→ 需要 3.0 以上"
+    cmd "$(pkg_hint tmux)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 2. python3
+# ---------------------------------------------------------------------------
+
+check_python() {
+  local v major minor
+  if ! command -v python3 >/dev/null 2>&1; then
+    bad "找不到 python3 → 看板 / 狀態機 / 報告驗證都需要它"
+    cmd "$(pkg_hint python3)"
+    return
+  fi
+  v=$(python3 -c 'import sys; print("%d %d" % sys.version_info[:2])' 2>/dev/null || echo '')
+  if [ -z "$v" ]; then
+    sus "python3 存在但問不到版本,無法確認是否 ≥ 3.8"
+    return
+  fi
+  major=${v% *}
+  minor=${v#* }
+  if ver_ge "$major" "$minor" 3 8; then
+    ok "python3 $major.$minor"
+  else
+    bad "python3 版本過舊($major.$minor)→ 需要 3.8 以上"
+    cmd "$(pkg_hint python3)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 3. fleet 在不在 PATH 上
+# ---------------------------------------------------------------------------
+
+check_path() {
+  local p found n first bindir seen
+  found=''
+  seen=''
+  local IFS=:
+  # PATH 上同一個目錄重複出現很常見(rc 被 source 兩次),要去重,
+  # 不然會報「有 3 個 fleet」但其實是同一個檔——那是假警報。
+  for p in $PATH; do
+    [ -n "$p" ] || p=.
+    case "$seen" in *":$p:"*) continue ;; esac
+    seen="$seen:$p:"
+    if [ -x "$p/fleet" ] && [ ! -d "$p/fleet" ]; then
+      found="$found$p/fleet
+"
+    fi
+  done
+  unset IFS
+
+  if [ -z "$found" ]; then
+    bindir="$HOME/.local/bin"
+    sus "PATH 上沒有 fleet → 加上:export PATH=\"\$HOME/.local/bin:\$PATH\""
+    hint "(Debian/Ubuntu 的 ~/.bashrc 前段會 early return,這行要放檔案最前面)"
+    if [ ! -x "$bindir/fleet" ]; then
+      hint "$bindir/fleet 也不存在 —— 還沒裝?跑 ./install.sh"
+    fi
+    return
+  fi
+
+  n=$(printf '%s' "$found" | grep -c . || true)
+  first=$(printf '%s' "$found" | head -n 1)
+  if [ "$n" -gt 1 ]; then
+    sus "PATH 上有 $n 個 fleet,實際生效的是第一個:$first"
+    printf '%s' "$found" | while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      if [ -L "$p" ]; then
+        printf '      %s → %s\n' "$p" "$(readlink "$p")"
+      else
+        printf '      %s\n' "$p"
+      fi
+    done
+    hint "多個同名執行檔很容易升級了 A 卻一直在跑 B,建議清掉不要的那幾個"
+  else
+    if [ -L "$first" ]; then
+      ok "fleet:$first → $(readlink "$first")"
+    else
+      ok "fleet:$first"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 4. 目錄可寫
+# ---------------------------------------------------------------------------
+
+check_dir_writable() {
+  local label=$1 dir=$2 probe
+  if [ ! -d "$dir" ]; then
+    sus "${label}不存在:$(tilde "$dir")"
+    cmd "mkdir -p $(tilde "$dir")"
+    return
+  fi
+  probe="$dir/.fleet-doctor-write-test.$$"
+  if ( : > "$probe" ) 2>/dev/null; then
+    rm -f "$probe" 2>/dev/null || true
+    ok "${label}可寫:$(tilde "$dir")"
+  else
+    bad "${label}不可寫:$(tilde "$dir")"
+    cmd "ls -ld $(tilde "$dir")   # 看擁有者與權限"
+  fi
+}
+
+check_dirs() {
+  check_dir_writable "profile 目錄" "$FLEET_PROFILE_DIR"
+  check_dir_writable "報告目錄" "$FLEET_REPORTS"
+  check_dir_writable "派工單目錄" "$FLEET_TASKS"
+}
+
+# ---------------------------------------------------------------------------
+# 5. registry
+# ---------------------------------------------------------------------------
+# tmux server 沒跑的時候驗不了 pane,那是「診斷不出來」(⚠)不是「壞掉」(✗)。
+
+TMUX_SERVERS_UP=''   # 快取:已確認有 server 的 socket
+TMUX_SERVERS_DOWN=''
+REG_KINDS=''         # registry 裡實際用到的 kind(給 adapter 檢查用)
+
+server_up() {
+  local sock=$1 key
+  key=" $sock "
+  case "$TMUX_SERVERS_UP" in *"$key"*) return 0 ;; esac
+  case "$TMUX_SERVERS_DOWN" in *"$key"*) return 1 ;; esac
+  if stmux "$sock" list-sessions >/dev/null 2>&1; then
+    TMUX_SERVERS_UP="$TMUX_SERVERS_UP$key"
+    return 0
+  fi
+  TMUX_SERVERS_DOWN="$TMUX_SERVERS_DOWN$key"
+  return 1
+}
+
+sock_label() {
+  if [ "$1" = "-" ] || [ -z "$1" ]; then printf '預設 socket'; else printf 'socket %s' "$1"; fi
+}
+
+# pane 到底還在不在。
+#
+# **刻意不用 lib/registry.sh 的 pane_alive。** 實測(tmux 3.7b):
+#     tmux display-message -p -t '%99999' '#{pane_id}'   → 離開碼 0,輸出空字串
+# 也就是說 pane_alive 對一個根本不存在的 pane 會回「活著」。
+# doctor 的整個價值就在於「說壞掉就真的壞掉、說沒事就真的沒事」,
+# 這裡不能用一個會給假 ✓ 的判斷,改成直接去問這個 socket 上真正存在的 pane 清單。
+# (registry 通常只有個位數筆,一筆一次 list-panes 的成本可以接受。)
+pane_exists() {
+  local sock=$1 pane=$2
+  stmux "$sock" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$pane"
+}
+
+check_registry() {
+  local n dead=0 line id sock pane kind
+
+  if [ ! -f "$FLEET_REG" ]; then
+    sus "registry 還不存在:$(tilde "$FLEET_REG")(還沒登記過任何 worker)"
+    cmd "fleet discover        # 掃出現有的 claude / codex pane"
+    return
+  fi
+
+  n=$(awk -F'\t' 'NF{c++} END{print c+0}' "$FLEET_REG")
+  if [ "$n" -eq 0 ]; then
+    note "registry 是空的 —— 還沒接管任何 worker"
+    cmd "fleet discover        # 掃出現有的 claude / codex pane"
+    cmd "fleet adopt <id> <%NN>"
+    return
+  fi
+
+  note "registry:$n 筆"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    id=$(printf '%s' "$line" | cut -f1)
+    sock=$(printf '%s' "$line" | cut -f2)
+    pane=$(printf '%s' "$line" | cut -f3)
+    kind=$(printf '%s' "$line" | cut -f4)
+    [ -n "$id" ] || continue
+
+    case " $REG_KINDS " in
+      *" $kind "*) ;;
+      *) [ -n "$kind" ] && REG_KINDS="$REG_KINDS $kind" ;;
+    esac
+
+    # pane 欄格式:只接受穩定 pane id。session:win 座標會因為別人插一格
+    # 而整排位移,派工就送到別人的視窗去 —— 這是確定會壞,不是不確定。
+    if ! valid_pane "$pane"; then
+      bad "  $id:pane 欄「${pane}」不是穩定 pane id(%NN)"
+      hint "session:window 座標會因為別人插一格而整排位移,派工會送錯人"
+      cmd "fleet forget $id && fleet discover && fleet adopt $id <%NN> $sock"
+      continue
+    fi
+
+    if ! server_up "$sock"; then
+      sus "  $id:$(sock_label "$sock") 上沒有 tmux server 在跑,無法驗證 pane $pane 是否存活"
+      continue
+    fi
+
+    if pane_exists "$sock" "$pane"; then
+      ok "  $id  $pane  ${kind:-?}  ($(sock_label "$sock"))"
+    else
+      bad "  $id:pane $pane 已經不在了($(sock_label "$sock"))"
+      cmd "fleet forget $id"
+      dead=$((dead + 1))
+    fi
+  done < "$FLEET_REG"
+
+  if [ "$dead" -gt 1 ]; then
+    hint "有 $dead 隻 worker 的 pane 都不見了,可能是整個 tmux session 被關掉了"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 6. 指揮官
+# ---------------------------------------------------------------------------
+
+check_commander() {
+  local sock pane nf line
+
+  if [ ! -f "$FLEET_COMMANDER_FILE" ]; then
+    bad "還沒設定指揮官 pane → watcher 不知道要把通知送給誰(整個回報閉環等於沒開)"
+    hint "在你(指揮官)坐的那一格終端裡跑第一行,把印出來的 %NN 填進第二行:"
+    cmd "tmux display -p '#{pane_id}'"
+    cmd "fleet commander <上面印出來的 %NN>"
+    return
+  fi
+
+  line=$(head -n 1 "$FLEET_COMMANDER_FILE" 2>/dev/null || true)
+  if [ -z "$line" ]; then
+    bad "指揮官設定檔是空的:$(tilde "$FLEET_COMMANDER_FILE")"
+    cmd "tmux display -p '#{pane_id}'"
+    cmd "fleet commander <上面印出來的 %NN>"
+    return
+  fi
+
+  nf=$(printf '%s' "$line" | awk -F'\t' '{print NF}')
+  sock=$(commander_socket)
+  pane=$(commander_pane)
+
+  if [ "$nf" -lt 2 ]; then
+    sus "指揮官設定是舊的單欄格式(只有 pane),已當成預設 socket 處理"
+    hint "新格式是兩欄 socket<TAB>pane,支援指揮官不在預設 socket 的情況"
+    cmd "fleet commander $pane        # 重設一次就會寫成新格式"
+  fi
+
+  if ! valid_pane "$pane"; then
+    bad "指揮官 pane「${pane}」不是 %NN 形式"
+    cmd "tmux display -p '#{pane_id}'"
+    cmd "fleet commander <上面印出來的 %NN>"
+    return
+  fi
+
+  if ! server_up "$sock"; then
+    sus "指揮官 $pane($(sock_label "$sock")):該 socket 沒有 tmux server 在跑,無法驗證存活"
+    return
+  fi
+
+  if pane_exists "$sock" "$pane"; then
+    ok "指揮官:$pane($(sock_label "$sock"))"
+  else
+    bad "指揮官 pane $pane 已經不在了($(sock_label "$sock"))→ 通知會全部靜默失敗"
+    cmd "tmux display -p '#{pane_id}'"
+    cmd "fleet commander <上面印出來的 %NN>"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 7. watcher
+# ---------------------------------------------------------------------------
+# 三件事分開查:pid 檔在不在、那個 pid 活不活、活著的那個是不是 watcher。
+# 只查前兩項會被 pid 重用騙過去 —— 舊 watcher 死了、pid 被別的行程撿走,
+# 看起來一切正常,實際上沒有人在盯報告。
+
+check_watcher() {
+  local pid comm
+
+  if [ ! -f "$FLEET_PIDFILE" ]; then
+    sus "watcher 沒在跑(沒有 $(tilde "$FLEET_PIDFILE"))→ 沒人會叫醒你"
+    cmd "fleet watch start"
+    return
+  fi
+
+  pid=$(head -n 1 "$FLEET_PIDFILE" 2>/dev/null | tr -d '[:space:]')
+  if ! printf '%s' "$pid" | grep -qE '^[0-9]+$'; then
+    bad "pid 檔內容不是數字:「${pid}」($(tilde "$FLEET_PIDFILE"))"
+    cmd "fleet watch stop && fleet watch start"
+    return
+  fi
+
+  # **先問 ps 再問 kill -0。** kill -0 對「活著但不是我的」行程會回 EPERM
+  # (非零),照字面解讀會把別人的行程誤報成「已經不在了」——實測 pid 1
+  # (launchd)就是這樣。ps 問得到指令列才是行程真的存在的證據。
+  comm=$(ps -o command= -p "$pid" 2>/dev/null || true)
+  [ -n "$comm" ] || comm=$(ps -o args= -p "$pid" 2>/dev/null || true)
+
+  if [ -z "$comm" ]; then
+    if kill -0 "$pid" 2>/dev/null; then
+      sus "watcher pid $pid 存在,但問不到它的指令列,無法確認就是 watcher"
+      return
+    fi
+    bad "pid 檔寫著 $pid,但這個行程已經不在了(watcher 掛掉或被 kill,pid 檔沒清)"
+    cmd "fleet watch start"
+    return
+  fi
+
+  case "$comm" in
+    *fleet-watcher*)
+      ok "watcher 執行中(pid $pid)"
+      ;;
+    *)
+      bad "pid $pid 活著但**不是 watcher**(watcher 死掉後 pid 被別的行程撿走了):$comm"
+      hint "看起來像在跑,其實沒有人在盯報告 —— 這是最危險的一種假象,只查 pid 活不活會被騙過去"
+      cmd "rm -f $(tilde "$FLEET_PIDFILE") && fleet watch start"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# 8. state.json
+# ---------------------------------------------------------------------------
+
+check_state() {
+  local bin out rc counts nrep nwrk orphans
+
+  bin="$FLEET_LIBDIR/libexec/fleet-state"
+  if [ ! -x "$bin" ]; then
+    bad "找不到狀態機:$bin(安裝不完整)"
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    sus "沒有 python3,跳過 state.json 檢查"
+    return
+  fi
+
+  if [ ! -f "$FLEET_STATE_FILE" ]; then
+    note "state.json 還沒建立(第一次啟動 watcher 時會自動建)"
+    return
+  fi
+
+  rc=0
+  out=$("$bin" dump --state "$FLEET_STATE_FILE" 2>&1) || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    bad "state.json 讀不出來(fleet-state dump 離開碼 $rc):$(tilde "$FLEET_STATE_FILE")"
+    printf '%s\n' "$out" | sed 's/^/      /'
+    return
+  fi
+
+  # dump 讀到壞掉的 JSON 時會就地把原檔 rename 成 .corrupt 並回一份空 state,
+  # 所以「原檔不見了 + 出現 .corrupt」就是剛剛被判定壞掉。
+  if [ ! -f "$FLEET_STATE_FILE" ] && [ -f "$FLEET_STATE_FILE.corrupt" ]; then
+    sus "state.json 內容壞掉,已自動備份成 $(tilde "$FLEET_STATE_FILE.corrupt") 並重建空的"
+    hint "最壞的後果是舊報告重播一次通知,比整套卡死好;不用手動處理"
+    return
+  fi
+
+  counts=$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("? ?")
+    sys.exit(0)
+print("%d %d" % (len(d.get("reports") or {}), len(d.get("workers") or {})))
+' 2>/dev/null || echo '? ?')
+  nrep=${counts% *}
+  nwrk=${counts#* }
+  ok "state.json 正常:報告記錄 $nrep 筆、worker 記錄 $nwrk 筆"
+
+  # 孤兒 worker:state 裡有、registry 裡沒有。留著會讓 QUIET_AFTER_REPORT
+  # 之類的判斷一直參考到早就不存在的 worker。
+  if [ -f "$FLEET_REG" ]; then
+    orphans=$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+ids = set()
+try:
+    with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if parts and parts[0].strip():
+                ids.add(parts[0].strip())
+except OSError:
+    pass
+for w in sorted((d.get("workers") or {})):
+    if w not in ids:
+        print(w)
+' "$FLEET_REG" 2>/dev/null || true)
+    if [ -n "$orphans" ]; then
+      sus "state.json 裡有不在 registry 的 worker:$(printf '%s' "$orphans" | tr '\n' ' ')"
+      cmd "fleet gc"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 9. adapters
+# ---------------------------------------------------------------------------
+# 每個 conf 的 regex 都實際餵給 grep -E 驗一次語法。
+# 壞掉的 regex 會讓 grep 直接失敗,而失敗會被當成「不符合」——
+# 於是忙碌的 worker 永遠被判定成閒置,狂發假警報。這是靜默故障,
+# 不主動驗根本看不出來。
+
+REGEX_KEYS="detect ready busy stuck asking trust composer ctx"
+
+check_adapters() {
+  local f kind names n=0 key re rc broken cli
+
+  if [ ! -d "$FLEET_ADAPTER_DIR" ]; then
+    bad "找不到 adapters 目錄:$FLEET_ADAPTER_DIR(安裝不完整)"
+    return
+  fi
+
+  names=''
+  for f in "$FLEET_ADAPTER_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    kind=$(basename "$f" .conf)
+    names="$names $kind"
+    n=$((n + 1))
+  done
+
+  if [ "$n" -eq 0 ]; then
+    bad "$FLEET_ADAPTER_DIR 裡沒有任何 *.conf → 所有狀態判定都會失效"
+    return
+  fi
+
+  note "adapters:$n 個 kind —$(printf '%s' "$names")"
+
+  for f in "$FLEET_ADAPTER_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    kind=$(basename "$f" .conf)
+    broken=0
+    for key in $REGEX_KEYS; do
+      re=$(signals_get "$kind" "$key" 2>/dev/null || true)
+      [ -n "$re" ] || continue
+      # grep -E:0=有比中、1=沒比中、2=regex 語法錯。只有 2 是問題。
+      rc=0
+      printf '' | LC_ALL=C grep -qE "$re" >/dev/null 2>&1 || rc=$?
+      if [ "$rc" -gt 1 ]; then
+        bad "  $kind.conf 的 $key= 不是合法的 ERE:$re"
+        hint "壞掉的 regex 會讓比對永遠失敗 → 忙碌的 worker 被誤判成閒置(靜默故障)"
+        broken=$((broken + 1))
+      fi
+    done
+    if [ "$broken" -eq 0 ]; then
+      ok "  $kind.conf regex 全部通過 grep -E 驗證"
+    fi
+  done
+
+  # 只檢查 registry 裡真的有在用的 kind 對應的 CLI。
+  # 沒有 cx worker 就不去管 codex 裝了沒 —— 那不是這個環境的問題。
+  for kind in $REG_KINDS; do
+    cli=$(signals_get "$kind" command 2>/dev/null || true)
+    [ -n "$cli" ] || continue
+    if command -v "$cli" >/dev/null 2>&1; then
+      ok "  $kind 用的 CLI「${cli}」找得到"
+    else
+      sus "  registry 有 $kind worker,但 PATH 上找不到它的 CLI「${cli}」"
+      hint "已 adopt 的 pane 照樣能用(fleet 只送字不啟動它);但 fleet up / fleet add $kind 會失敗"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# 10. 設定檔
+# ---------------------------------------------------------------------------
+
+check_config() {
+  local f n bad_n
+  f=$(fleet_config_path)
+  if [ ! -f "$f" ]; then
+    note "設定檔不存在:$(tilde "$f")(全部走內建預設,這樣也完全可以)"
+    return
+  fi
+  # 生效的條數 = 非空、非註解、且 key 符合 FLEET_ 大寫規則的行
+  n=$(awk '
+    /^[[:space:]]*$/  {next}
+    /^[[:space:]]*#/  {next}
+    /^[[:space:]]*FLEET_[A-Z0-9_]+[[:space:]]*=/ {c++}
+    END{print c+0}' "$f")
+  bad_n=$(awk '
+    /^[[:space:]]*$/  {next}
+    /^[[:space:]]*#/  {next}
+    /^[[:space:]]*FLEET_[A-Z0-9_]+[[:space:]]*=/ {next}
+    {c++}
+    END{print c+0}' "$f")
+  ok "設定檔:$(tilde "$f")($n 條生效)"
+  if [ "$bad_n" -gt 0 ]; then
+    sus "  同一個檔案裡有 $bad_n 行會被拒絕載入(不是 FLEET_ 開頭的大寫 KEY=value)"
+    cmd "fleet config        # 看每個值現在是誰決定的"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 11. 舊佈局偵測
+# ---------------------------------------------------------------------------
+
+check_legacy() {
+  local old="${FLEET_OLD_DIR:-$HOME/.claude/fleet}"
+  if [ -f "$old/registry" ]; then
+    sus "偵測到舊版個人佈局:$(tilde "$old")"
+    cmd "./install.sh --migrate --dry-run    # 先看會做什麼"
+    cmd "./install.sh --migrate"
+    hint "遷移只複製不刪,舊檔會原封不動留著"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
+nreports() {
+  [ -d "$FLEET_REPORTS" ] || { printf '0'; return; }
+  find "$FLEET_REPORTS" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' '
+}
+
+main() {
+  printf '%s🩺 fleet doctor%s — %s @ %s %s\n\n' \
+    "$c_cyn" "$c_rst" \
+    "$FLEET_PROFILE" \
+    "$(hostname 2>/dev/null || echo '?')" \
+    "$(date '+%Y-%m-%d %H:%M:%S')"
+
+  check_tmux
+  check_python
+  check_path
+  check_dirs
+  check_registry
+  check_commander
+  check_watcher
+  check_state
+  check_adapters
+  check_config
+  check_legacy
+
+  printf '\n'
+  note "profile=$FLEET_PROFILE  資料目錄=$(tilde "$FLEET_HOME")  報告目錄=$(tilde "$FLEET_REPORTS")($(nreports) 份)"
+
+  printf '\n'
+  if [ "$FAILS" -eq 0 ] && [ "$WARNS" -eq 0 ]; then
+    printf '%s🟢 全部通過%s\n' "$c_grn" "$c_rst"
+  elif [ "$FAILS" -eq 0 ]; then
+    printf '%s🟡 %d 項提醒,沒有壞掉的東西%s\n' "$c_ylw" "$WARNS" "$c_rst"
+  else
+    printf '%s🔴 有 %d 項需要處理%s' "$c_red" "$FAILS" "$c_rst"
+    if [ "$WARNS" -gt 0 ]; then
+      printf '%s(另有 %d 項提醒)%s' "$c_ylw" "$WARNS" "$c_rst"
+    fi
+    printf '\n'
+  fi
+
+  return "$FAILS"
+}
+
+main
+exit $?
