@@ -45,12 +45,22 @@ jobs:
             command -v tmux       >/dev/null 2>&1 || brew install tmux
             command -v bats       >/dev/null 2>&1 || brew install bats-core
             command -v shellcheck >/dev/null 2>&1 || brew install shellcheck
+            # bats 的 shebang 是 `#!/usr/bin/env bash`，而 macOS runner 上那是
+            # 內建的 bash 3.2。bash 3.2 的 `printf %q` 會把中文測試名打成亂碼
+            # （$'\215\232\204' 這種），bats 接著就找不到自己產生的函式名，
+            # 報一整排 unknown test name 並「執行 0 個測試」而失敗。
+            # 裝 bash 5 讓 `env bash` 找到它即可。
+            # 註：fleet 本身仍以 bash 3.2 為相容目標，這只影響測試框架。
+            brew list --formula bash >/dev/null 2>&1 || brew install bash
           fi
 
       - name: 顯示工具版本
         run: |
           set -e
           tmux -V
+          # bats 實際會用哪一個 bash（macOS 上必須是 5.x，理由見上一步的註解）
+          command -v bash
+          bash --version | head -n 1
           bats --version
           shellcheck --version | head -n 3
           python3 --version
