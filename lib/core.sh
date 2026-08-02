@@ -213,12 +213,36 @@ fleet_unlock() {
 # ---------------------------------------------------------------------------
 
 # 檔案 mtime(epoch 秒)。BSD stat 與 GNU stat 旗標不同。
+#
+# **不可以寫成 `stat -f %m "$f" || stat -c %Y "$f"`。**
+# GNU coreutils 的 `-f` 是「顯示**檔案系統**狀態」。它確實會以離開碼 1 收場,
+# 所以 fallback 有跑——但它**在失敗之前已經把檔案系統資訊印到 stdout 了**,
+# 於是整個函式的輸出變成 "File: ... Block size: 4096 ...\n1785694372",
+# 呼叫端拿去做數值比較就全錯。macOS 上完全測不出來,只有 Linux 才會爆(實測 debian)。
+# 正確做法:先試 GNU(macOS 的 BSD stat 沒有 -c,會乾脆失敗且不吐東西),
+# 而且**驗輸出是不是純數字**——跨平台的旗標差異不能只靠離開碼判斷。
 fleet_mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+  local m
+  m=$(stat -c %Y "$1" 2>/dev/null) || m=''
+  case "$m" in
+    '' | *[!0-9]*) m=$(stat -f %m "$1" 2>/dev/null) || m='' ;;
+  esac
+  case "$m" in
+    '' | *[!0-9]*) m=0 ;;
+  esac
+  printf '%s\n' "$m"
 }
 
+# 同理:BSD 是 `md5 -q`,GNU 是 `md5sum`。這兩個名字不同,不會互相誤觸,
+# 但還是驗一下輸出長度,免得靜默回一坨垃圾當雜湊。
 fleet_md5() {
-  md5 -q "$1" 2>/dev/null || md5sum "$1" 2>/dev/null | cut -d' ' -f1 || echo ""
+  local h
+  h=$(md5 -q "$1" 2>/dev/null) || h=''
+  [ -n "$h" ] || h=$(md5sum "$1" 2>/dev/null | cut -d' ' -f1)
+  case "$h" in
+    *[!0-9a-fA-F]* | '') printf '' ;;
+    *) printf '%s' "$h" ;;
+  esac
 }
 
 fleet_now() { date +%s; }
