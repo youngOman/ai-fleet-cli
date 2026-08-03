@@ -214,11 +214,35 @@ spawn_worker() {
 fmt_list() { printf '%s' "$1" | tr '\n' ' ' | sed 's/  */ /g;s/^ //;s/ $//'; }
 
 # 這個 profile 由 fleet 開出來、且 registry 裡還有登記的 socket
+# 列出「fleet 自己開出來的」socket。兩個來源要聯集:
+#   (a) registry 裡登記過的
+#   (b) 還活著、但一筆登記都沒有的殘留組——例如 fleet up 開到一半失敗,
+#       或 worker 全被 fleet forget 掉。只看 registry 的話 fleet down 收不掉它們,
+#       使用者只能自己去 tmux -L <名> kill-server,那正是這個工具該幫他做的事。
 spawn_sockets() {
-  [ -f "$FLEET_REG" ] || return 0
-  awk -F'\t' -v base="$FLEET_SOCKET" '
-    $2 == base || $2 ~ "^" base "-[0-9]+$" { if (!seen[$2]++) print $2 }
-  ' "$FLEET_REG"
+  local out='' d f name suffix
+  if [ -f "$FLEET_REG" ]; then
+    out=$(awk -F'\t' -v base="$FLEET_SOCKET" '
+      $2 == base || $2 ~ "^" base "-[0-9]+$" { if (!seen[$2]++) print $2 }
+    ' "$FLEET_REG")
+  fi
+  d="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+  if [ -d "$d" ]; then
+    for f in "$d"/*; do
+      [ -e "$f" ] || continue
+      name=$(basename "$f")
+      # 嚴格比對 <base> 或 <base>-<數字>,別的一律不碰
+      if [ "$name" != "$FLEET_SOCKET" ]; then
+        suffix=${name#"$FLEET_SOCKET"-}
+        [ "$suffix" != "$name" ] || continue
+        case "$suffix" in '' | *[!0-9]*) continue ;; esac
+      fi
+      tmux -L "$name" list-sessions >/dev/null 2>&1 || continue
+      out="$out
+$name"
+    done
+  fi
+  printf '%s\n' "$out" | awk 'NF && !seen[$0]++'
 }
 
 # 第一個還沒有 tmux server 在跑的 socket 名
