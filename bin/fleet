@@ -180,21 +180,74 @@ next_id() {
 }
 
 spawn_worker() {
-  local id=$1 kind=$2 dir=$3 cmd pane
+  local id=$1 kind=$2 dir=$3 sock=${4:-$FLEET_SOCKET} sess=${5:-$FLEET_SESSION} cmd pane
   cmd=$(signals_get "$kind" command)
   [ -n "$cmd" ] || { fleet_err "adapters/$kind.conf 沒有定義 command"; return 1; }
   # -P -F 取回**穩定 pane id**。舊版登記 session:window 名稱,window 改名或重排就送錯人。
-  pane=$(tmux -L "$FLEET_SOCKET" new-window -t "$FLEET_SESSION" -n "$id" -c "$dir" -P -F '#{pane_id}') \
+  pane=$(tmux -L "$sock" new-window -t "$sess" -n "$id" -c "$dir" -P -F '#{pane_id}') \
     || { fleet_err "$id: 開 window 失敗"; return 1; }
-  tmux -L "$FLEET_SOCKET" send-keys -t "$pane" "$cmd" Enter
+  tmux -L "$sock" send-keys -t "$pane" "$cmd" Enter
   printf '  %s%-6s%s %-8s %s ... ' "$c_ylw" "$id" "$c_rst" "$cmd" "$dir"
-  if wait_ready "$FLEET_SOCKET" "$pane" "$kind"; then
-    reg_add "$id" "$FLEET_SOCKET" "$pane" "$kind"
+  if wait_ready "$sock" "$pane" "$kind"; then
+    reg_add "$id" "$sock" "$pane" "$kind"
     printf '%sready%s (%s)\n' "$c_grn" "$c_rst" "$pane"
   else
-    reg_add "$id" "$FLEET_SOCKET" "$pane" "$kind"
-    printf '%s逾時%s (%s;tmux -L %s attach 看看)\n' "$c_red" "$c_rst" "$pane" "$FLEET_SOCKET"
+    reg_add "$id" "$sock" "$pane" "$kind"
+    printf '%s逾時%s (%s;tmux -L %s attach 看看)\n' "$c_red" "$c_rst" "$pane" "$sock"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# 多組 spawn 艦隊
+# ---------------------------------------------------------------------------
+# 「再開一組」本來要使用者自己 export FLEET_SOCKET / FLEET_SESSION / FLEET_PROFILE,
+# 那是把設計缺陷丟給使用者。實際上 send / peek / task / ls / 看板 / watcher 全都
+# 從 registry 讀「這個 worker 在哪個 socket」,本來就跨 socket 可用;
+# 只有 up / add / attach / down 這四個綁死了全域 $FLEET_SOCKET。
+# 所以讓 up 自己挑一個沒被佔用的 socket 就好,其餘指令不必改用法。
+#
+# 命名規則:$FLEET_SOCKET、$FLEET_SOCKET-2、$FLEET_SOCKET-3 …
+# **刻意只認這個規則**——adopt 到別的具名 socket(例如 fleet adopt x %5 mysock)
+# 不會被誤判成「fleet 開的」,fleet down 才不會去 kill 使用者自己的 tmux server。
+
+# 這個 profile 由 fleet 開出來、且 registry 裡還有登記的 socket
+spawn_sockets() {
+  [ -f "$FLEET_REG" ] || return 0
+  awk -F'\t' -v base="$FLEET_SOCKET" '
+    $2 == base || $2 ~ "^" base "-[0-9]+$" { if (!seen[$2]++) print $2 }
+  ' "$FLEET_REG"
+}
+
+# 第一個還沒有 tmux server 在跑的 socket 名
+next_free_socket() {
+  local base=$1 cand=$1 n=2
+  while tmux -L "$cand" list-sessions >/dev/null 2>&1; do
+    cand="$base-$n"
+    n=$((n + 1))
+    if [ "$n" -gt 64 ]; then
+      fleet_err "找不到空的 socket($base-2 到 $base-64 都被佔用了)"
+      return 1
+    fi
+  done
+  printf '%s' "$cand"
+}
+
+# 最近一組還活著的 spawn socket(fleet add 預設加到這一組)
+newest_spawn_socket() {
+  local s last=''
+  for s in $(spawn_sockets); do
+    tmux -L "$s" list-sessions >/dev/null 2>&1 && last=$s
+  done
+  [ -n "$last" ] || return 1
+  printf '%s' "$last"
+}
+
+# 這個 socket 上 fleet 開的 session 名(找不到就用預設)
+socket_session() {
+  local sock=$1 s
+  s=$(tmux -L "$sock" list-sessions -F '#{session_name}' 2>/dev/null | head -1)
+  [ -n "$s" ] || s="$FLEET_SESSION"
+  printf '%s' "$s"
 }
 
 cmd_up() {
@@ -209,22 +262,66 @@ cmd_up() {
   done
   [ -d "$dir" ] || fleet_die "工作目錄不存在:$dir"
   tmux -L "$FLEET_SOCKET" has-session -t "$FLEET_SESSION" 2>/dev/null \
-    && fleet_die "已有 spawn 出來的艦隊在跑。用 fleet add 增援,或 fleet down 收掉重建。"
+    && fleet_die "已有 spawn 出來的艦隊在跑($FLEET_SOCKET:$FLEET_SESSION)。
+  只是想多幾隻幫手 → fleet add cc -n 3 [目錄]   (最常見,不必收掉現有的)
+  想收掉重開一組   → fleet down 之後再 fleet up
+  想要完全獨立的第二艦隊(各自的 registry / 指揮官 / watcher):
+    fleet profile lab
+    export FLEET_PROFILE=lab FLEET_SOCKET=lab FLEET_SESSION=lab
+    fleet up --cc 3 --cx 2 -C <目錄>"
   fleet_info "新開艦隊(socket=$FLEET_SOCKET,目錄=$dir)"
   tmux -L "$FLEET_SOCKET" new-session -d -s "$FLEET_SESSION" -n commander -c "$dir" -x 220 -y 55
   [ "$nc" -gt 0 ] && for i in $(seq 1 "$nc"); do spawn_worker "$(next_id cc)" cc "$dir"; done
   [ "$nx" -gt 0 ] && for i in $(seq 1 "$nx"); do spawn_worker "$(next_id cx)" cx "$dir"; done
   echo
   fleet_info "完成。fleet ls 看清單。"
+  readiness_hint
 }
 
 cmd_add() {
-  local kind=${1:-} dir=${2:-$FLEET_DEFAULT_DIR}
-  [ -n "$kind" ] || fleet_die "用法:fleet add <kind> [目錄];可用的 kind:$(signals_kinds | tr '\n' ' ')"
-  signals_load "$kind" || fleet_die "沒有 adapters/$kind.conf;可用的 kind:$(signals_kinds | tr '\n' ' ')"
+  local kind=${1:-} n=1 dir="" i
+  shift 2>/dev/null || true
+  [ -n "$kind" ] \
+    || fleet_die "用法:fleet add <kind> [-n 幾隻] [目錄];可用的 kind:$(signals_kinds | tr '\n' ' ')"
+  signals_load "$kind" \
+    || fleet_die "沒有 adapters/$kind.conf;可用的 kind:$(signals_kinds | tr '\n' ' ')"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n | --count) n=$2; shift 2 ;;
+      -C | --dir) dir=$2; shift 2 ;;
+      *) dir=$1; shift ;;        # 相容舊用法 `fleet add cc <目錄>`
+    esac
+  done
+  [ -n "$dir" ] || dir="$FLEET_DEFAULT_DIR"
+  case "$n" in '' | *[!0-9]*) fleet_die "-n 要是數字" ;; esac
+  [ "$n" -ge 1 ] || fleet_die "-n 至少是 1"
+  [ -d "$dir" ] || fleet_die "工作目錄不存在:$dir"
   tmux -L "$FLEET_SOCKET" has-session -t "$FLEET_SESSION" 2>/dev/null \
     || tmux -L "$FLEET_SOCKET" new-session -d -s "$FLEET_SESSION" -n commander -c "$dir" -x 220 -y 55
-  spawn_worker "$(next_id "$kind")" "$kind" "$dir"
+  for i in $(seq 1 "$n"); do
+    spawn_worker "$(next_id "$kind")" "$kind" "$dir"
+  done
+  readiness_hint
+}
+
+# 開完 worker 之後,回報閉環不一定是通的:指揮官沒設 or watcher 沒跑,
+# 兩者任一沒做,worker 交了報告也不會有人被叫醒——而且**完全沒有錯誤訊息**。
+# 這是最容易漏的一步,所以每次開完都主動查一次。
+readiness_hint() {
+  local missing=0
+  if [ ! -f "$FLEET_COMMANDER_FILE" ]; then
+    missing=1
+    fleet_warn "還沒設定指揮官 → 報告落地也沒人會被叫醒。在你自己那格終端裡:"
+    printf '    tmux display -p "#{pane_id}"\n'
+    printf '    fleet commander <印出來的 %%NN>\n'
+  fi
+  if ! "$LIBEXEC/fleet-watcher" status 2>/dev/null | head -1 | grep -q '運作中'; then
+    missing=1
+    fleet_warn "watcher 沒在跑 → 回報閉環是關著的:"
+    printf '    fleet watch start\n'
+  fi
+  [ "$missing" = 0 ] && fleet_info "回報閉環已就緒(指揮官已設定、watcher 運作中)。"
+  return 0
 }
 
 cmd_attach() {
@@ -465,7 +562,7 @@ ${c_grn}接管既有 pane(推薦,不用重開)${c_rst}
 
 ${c_grn}新開 worker(獨立 socket:$FLEET_SOCKET)${c_rst}
   fleet up [--cc N] [--cx M] [-C dir]  預設 2 claude + 1 codex
-  fleet add <kind> [dir]               動態增援一個
+  fleet add <kind> [-n N] [dir]        動態增援 N 隻(預設 1)
   fleet attach                         進去看
   fleet down [-y]                      收攤:kill 新開的、放掉接管的
 
