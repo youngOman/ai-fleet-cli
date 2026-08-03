@@ -60,6 +60,8 @@ ai-fleet-cli/
 | `FLEET_BACKFILL_SECS` | `600` | 首次見到且超過這個秒數的舊報告只建基準線不通知 |
 | `FLEET_MAX_ATTEMPTS` | `3` | 送達驗證連續失敗幾次後熔斷 |
 | `FLEET_LINT_REPORTS` | `1` | 通知前是否對報告跑四節驗證（`0` 關閉） |
+| `FLEET_MAIN_PANE_WIDTH` | `60%` | 版面左側主 pane 的寬度 |
+| `FLEET_MIN_PANE_HEIGHT` | `10` | 每格最低高度；再切下去會低於此值就改開獨立 window |
 
 **以上全部**都可以在 `config.env` 覆寫，也可以用真實環境變數覆寫（環境變數優先）。
 

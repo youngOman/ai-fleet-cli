@@ -195,6 +195,8 @@ WORKER_WINDOW=fleet
 
 # 左邊主格佔的寬度。tmux 3.1 以後才吃百分比,舊版會靜默失敗,不影響其他部分。
 : "${FLEET_MAIN_PANE_WIDTH:=60%}"
+# 每格至少要這麼高,狀態判定才可靠(實測 8 行還行、5 行全滅)。留一點餘裕。
+: "${FLEET_MIN_PANE_HEIGHT:=10}"
 
 apply_layout() {
   local sock=$1 target=$2
@@ -203,6 +205,30 @@ apply_layout() {
   tmux -L "$sock" set-window-option -t "$target" pane-border-format ' #{pane_title} ' 2>/dev/null || true
   tmux -L "$sock" set-window-option -t "$target" main-pane-width "$FLEET_MAIN_PANE_WIDTH" 2>/dev/null || true
   tmux -L "$sock" select-layout -t "$target" main-vertical 2>/dev/null || true
+}
+
+# 擠太扁的 pane 會讓狀態判定**整組失效**,而且是靜默的。
+#
+# 實測(220x55 的 window,main-vertical):
+#   高度 13 行 → busy / stuck 都判得出來
+#   高度  8 行 → 還可以
+#   高度  5 行 → **全滅**:跑中的 worker 被判成閒置(閒置警報狂噴)、
+#                真卡住偵測不到。因為 spinner 與狀態列被擠出可見範圍,
+#                而狀態判定只看可見畫面(scrollback 不能用,理由見 lib/tmuxio.sh)。
+#
+# 220x55 大約切到第 7 隻就會進入這個區間。所以切完量一下,太扁就把這一格
+# 拆出去自己一個 window——寧可看不到全部人,也不要看板與警報開始說謊。
+enforce_min_pane_height() {
+  local sock=$1 target=$2 pane=$3 id=$4 smallest
+  smallest=$(tmux -L "$sock" list-panes -t "$target" -F '#{pane_height}' 2>/dev/null \
+    | sort -n | head -1)
+  case "$smallest" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$smallest" -lt "$FLEET_MIN_PANE_HEIGHT" ] || return 0
+  # break-pane 的 -s 才是**來源 pane**;-t 是目的地 window。
+  # 寫成 -t "$pane" 不會報錯,但它會被當成 dst-window,整個保護靜默失效。
+  tmux -L "$sock" break-pane -d -s "$pane" -n "$id" 2>/dev/null || return 0
+  apply_layout "$sock" "$target"
+  fleet_warn "$id: 擠進同一個 window 會讓每格只剩 ${smallest} 行,狀態判定會失準 → 改開獨立 window(Ctrl-b n 可切過去)"
 }
 
 # 只開 pane、送啟動指令、寫 registry,**不等它 ready**(這步很快)。
@@ -226,6 +252,7 @@ spawn_pane() {
   # -P -F 取回**穩定 pane id**。舊版登記 session:window 名稱,window 改名或重排就送錯人。
   tmux -L "$sock" select-pane -t "$pane" -T "$id" 2>/dev/null || true
   apply_layout "$sock" "$target"
+  enforce_min_pane_height "$sock" "$target" "$pane" "$id"
   tmux -L "$sock" send-keys -t "$pane" "$cmd" Enter
   # 先登記:next_id 靠 registry 遞增,不先寫下一隻會拿到同一個 id
   reg_add "$id" "$sock" "$pane" "$kind"
