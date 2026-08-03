@@ -67,7 +67,10 @@ PIDFILE = _env("FLEET_PIDFILE", os.path.join(PROFILE_DIR, "watch.pid"))
 REPORTS = _env("FLEET_REPORTS", os.path.join(HOME, "fleet", "reports"))
 TASKS = _env("FLEET_TASKS", os.path.join(HOME, "fleet", "tasks"))
 
-CAPTURE_LINES = 60      # capture-pane -S -N
+# 狀態判定只看**可見畫面**,不吃 scrollback。
+# `capture-pane -S -N` 不是「最後 N 行」而是「往上 N 行 + 整個畫面」,
+# 拿去做狀態判定會讓畫面上早就消失的 `esc to interrupt` 永遠命中
+# → 閒置的 worker 一直顯示成跑中。
 TMUX_TIMEOUT = 5        # 秒;tmux 卡住不該讓整個看板卡住
 
 # ---------------------------------------------------------------------------
@@ -357,8 +360,7 @@ def inspect(w, panes):
         return row
 
     kind = w["kind"]
-    rc, screen = tmux(w["sock"], "capture-pane", "-p", "-t", w["pane"],
-                      "-S", "-%d" % CAPTURE_LINES)
+    rc, screen = tmux(w["sock"], "capture-pane", "-p", "-t", w["pane"])
     if rc != 0:
         row["state"] = "失聯"
         row["where"] = shorten_path(panes.get(w["pane"], ""))

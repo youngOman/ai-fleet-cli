@@ -168,13 +168,13 @@ ft_wait_for() {
   tmux -L "$FT_SOCKET" send-keys -t "$pane" -l -- 'hello'
   tmux -L "$FT_SOCKET" send-keys -t "$pane" Enter
   sleep 0.5
-  out=$(pane_capture "$FT_SOCKET" "$pane" 20)
+  out=$(pane_capture "$FT_SOCKET" "$pane")
   assert_contains "$out" "GOT hello"
 }
 
 @test "pane_capture:pane 不存在時回空字串而不是讓呼叫端掛掉" {
   # watcher 每 3 秒掃一輪,worker 關掉 pane 是常態。
-  run pane_capture "$FT_SOCKET" '%9999' 20
+  run pane_capture "$FT_SOCKET" '%9999'
   assert_rc 0 "$status"
   assert_eq "$output" ""
 }
@@ -241,22 +241,24 @@ ft_wait_for() {
   send_verified "$FT_SOCKET" "$pane" "📥 cc1 已交報告 r1800000000:修好登入 — 請驗收" "r1800000000" "" || rc=$?
   assert_rc 0 "$rc"
 
-  screen=$(pane_capture "$FT_SOCKET" "$pane" 150)
+  screen=$(pane_capture "$FT_SOCKET" "$pane")
   assert_contains "$screen" "r1800000000" "回傳 0 卻在畫面上找不到單號"
   assert_contains "$screen" "GOT" "假 TUI 沒有收到整行(Enter 沒送到?)"
 }
 
 @test "send_verified:pane 停在 shell 時回 3 而且什麼都沒送出去" {
   local before after rc
-  before=$(pane_capture "$FT_SOCKET" "$SHELL_PANE" 50)
+  before=$(pane_capture "$FT_SOCKET" "$SHELL_PANE")
   rc=0
   send_verified "$FT_SOCKET" "$SHELL_PANE" "不該出現的訊息 r777" "r777" "" || rc=$?
   assert_rc 3 "$rc"
 
-  after=$(pane_capture "$FT_SOCKET" "$SHELL_PANE" 50)
-  assert_eq "$after" "$before" "TUI 沒起來卻還是送了東西進 shell"
+  after=$(pane_capture "$FT_SOCKET" "$SHELL_PANE")
+  # 不比對整個畫面是否逐字相同——shell 的提示符可能在這期間才印出來,
+  # 那不是「我們送了東西進去」。要驗的是**訊息本身沒有進去**。
   case "$after" in
     *r777*) fail "訊息被打進使用者的 shell 了" ;;
+    *"不該出現的訊息"*) fail "訊息被打進使用者的 shell 了" ;;
   esac
 }
 
@@ -264,17 +266,20 @@ ft_wait_for() {
   local pane before after rc
   pane=$(ft_tui_pane)
 
-  # 先在假 TUI 裡打半句話製造 composer 忙碌的畫面(不按 Enter)
-  tmux -L "$FT_SOCKET" send-keys -t "$pane" -l -- 'draft half sentence'
+  # 先在假 TUI 裡打半句話製造 composer 忙碌的畫面(不按 Enter)。
+  # **提示符要一起打出來**——composer 判定看的是「提示符後面有沒有非空白字元」。
+  # 舊版這裡只打內容沒打提示符,卻仍然通過,是因為當時 pane_capture 會連
+  # scrollback 一起抓,命中了 scrollback 裡的 shell 提示符——測試在測一個假象。
+  tmux -L "$FT_SOCKET" send-keys -t "$pane" -l -- '❯ draft half sentence'
   sleep 0.5
-  before=$(pane_capture "$FT_SOCKET" "$pane" 20)
+  before=$(pane_capture "$FT_SOCKET" "$pane")
   assert_contains "$before" "draft half sentence" "沒能造出使用者打到一半的畫面"
 
   rc=0
   send_verified "$FT_SOCKET" "$pane" "插隊的通知 r888" "r888" "" || rc=$?
   assert_rc 2 "$rc"
 
-  after=$(pane_capture "$FT_SOCKET" "$pane" 20)
+  after=$(pane_capture "$FT_SOCKET" "$pane")
   assert_contains "$after" "draft half sentence" "使用者打的字被洗掉了"
   case "$after" in
     *r888*) fail "使用者在打字卻還是插隊注入了" ;;
@@ -317,7 +322,7 @@ ft_wait_for() {
   send_verified "$FT_SOCKET" "$pane" "$long" "r1800000001" "" || rc=$?
   assert_rc 0 "$rc" "長訊息折行後驗不到單號"
 
-  screen=$(pane_capture "$FT_SOCKET" "$pane" 150)
+  screen=$(pane_capture "$FT_SOCKET" "$pane")
   assert_contains "$screen" "r1800000001"
 }
 

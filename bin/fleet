@@ -331,7 +331,8 @@ cmd_peek() {
   [ -n "$id" ] || fleet_die "用法:fleet peek <id> [行數]"
   require_worker "$id"
   printf '%s──── %s(末 %s 行)────%s\n' "$c_cyn" "$id" "$lines" "$c_rst"
-  pane_capture "$(wsocket "$id")" "$(wpane "$id")" "$lines" | sed '/^[[:space:]]*$/d'
+  # peek 是給人看的,要往上翻多一點才有用 → 這裡刻意用含 scrollback 的版本
+  pane_capture_history "$(wsocket "$id")" "$(wpane "$id")" "$lines" | sed '/^[[:space:]]*$/d'
 }
 
 cmd_wait() {
@@ -340,7 +341,7 @@ cmd_wait() {
   require_worker "$id"
   kind=$(wkind "$id"); sock=$(wsocket "$id"); pane=$(wpane "$id")
   while [ "$i" -lt "$max" ]; do
-    scr=$(pane_capture "$sock" "$pane" 60)
+    scr=$(pane_capture "$sock" "$pane")
     # 用 adapter 的 busy 訊號,跟 watcher / 看板同一份規則。
     # 舊版這裡自己抓 spinner 動詞,會把正在幹活的 worker 誤判成 idle。
     pane_busy "$kind" "$scr" || { fleet_info "$id 看起來 idle 了"; return 0; }

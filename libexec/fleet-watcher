@@ -126,7 +126,9 @@ patrol_workers() {
     [ -n "$pane" ] || continue
     pane_exists "$sock" "$pane" || continue
 
-    screen=$(pane_capture "$sock" "$pane" 60)
+    # 只看可見畫面。吃 scrollback 會讓早就消失的 `esc to interrupt` /
+    # `Press up to edit queued` 永遠命中 → 閒置警報永遠不發、假卡住警報狂噴。
+    screen=$(pane_capture "$sock" "$pane")
     [ -n "$screen" ] || continue
 
     # 自動應答:攔截框(如 codex 的「降級到快模型」)自動選定值。

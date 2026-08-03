@@ -7,14 +7,48 @@
 [ -n "${_FLEET_TMUXIO_LOADED:-}" ] && return 0
 _FLEET_TMUXIO_LOADED=1
 
-# pane_capture <socket> <pane> [行數]
+# ---------------------------------------------------------------------------
+# 讀畫面
+# ---------------------------------------------------------------------------
+# ⚠️ `capture-pane -S -N` **不是「最後 N 行」**,是「從可見區頂端往上 N 行開始,
+#    一路抓到可見區底部」——所以它會回 N + 整個畫面高度的行數(實測 -S -8 回 59 行)。
+#
+#    這個誤解會造成靜默故障:狀態判定若吃到 scrollback,畫面上早就消失的字串會
+#    永遠命中。實案——使用者的 zsh 提示符是 `❯`,scrollback 裡的 `❯ clear`
+#    永遠符合 composer 規則,於是「使用者正在打字」恆真、**所有通知被無限延後**
+#    (rc=2 不記帳所以也不會熔斷,就這樣安靜地卡死)。
+#
+#    規則:**狀態判定一律只看可見畫面**,只有「找剛送出去的短單號」才需要 scrollback。
+
+# 可見畫面(不含 scrollback)
 pane_capture() {
-  local sock=$1 pane=$2 lines=${3:-0}
-  if [ "$lines" -gt 0 ] 2>/dev/null; then
-    stmux "$sock" capture-pane -p -t "$pane" -S -"$lines" 2>/dev/null || true
-  else
-    stmux "$sock" capture-pane -p -t "$pane" 2>/dev/null || true
-  fi
+  local sock=$1 pane=$2
+  stmux "$sock" capture-pane -p -t "$pane" 2>/dev/null || true
+}
+
+# 可見畫面「有內容的」最後 N 行。
+#
+# 不能直接 `tail -n N`:畫面沒被填滿時,底部是一堆空行,tail 會全部拿到空行,
+# 真正的 composer 行反而在上面被切掉。真 TUI 通常畫滿整屏所以看不出來,
+# 但只要 pane 很高或 TUI 剛啟動就會失效——這種「大部分時候剛好會動」的東西
+# 最難查。先剝掉尾端空行再取。
+pane_capture_tail() {
+  local sock=$1 pane=$2 n=${3:-8}
+  pane_capture "$sock" "$pane" | awk -v n="$n" '
+    { l[NR] = $0; if ($0 ~ /[^[:space:]]/) last = NR }
+    END {
+      if (!last) exit
+      s = last - n + 1
+      if (s < 1) s = 1
+      for (i = s; i <= last; i++) print l[i]
+    }'
+}
+
+# scrollback N 行 + 可見畫面。**只給送達驗證用**(短單號是唯一的,
+# 抓到舊的也不可能誤判)。不要拿來做狀態判定。
+pane_capture_history() {
+  local sock=$1 pane=$2 n=${3:-150}
+  stmux "$sock" capture-pane -p -t "$pane" -S -"$n" 2>/dev/null || true
 }
 
 # pane 是否在 copy-mode(使用者正在捲動 / 選字)
@@ -80,7 +114,7 @@ send_verified() {
   tui_ready "$sock" "$pane" || return 3
 
   # 3. 使用者正在打字 → 絕對不插隊
-  screen=$(pane_capture "$sock" "$pane" 8)
+  screen=$(pane_capture_tail "$sock" "$pane" 8)
   if composer_busy_content "$screen" "$kind"; then
     return 2
   fi
@@ -96,7 +130,7 @@ send_verified() {
 
   # 7. 回讀驗證。**只 grep 短單號**——長句會被 TUI 折行,grep 全文必定失敗。
   sleep 1
-  if pane_capture "$sock" "$pane" 150 | LC_ALL=C grep -qF "$tag"; then
+  if pane_capture_history "$sock" "$pane" 150 | LC_ALL=C grep -qF "$tag"; then
     return 0
   fi
   return 1
