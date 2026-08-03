@@ -180,21 +180,72 @@ next_id() {
 }
 
 spawn_worker() {
-  local id=$1 kind=$2 dir=$3 sock=${4:-$FLEET_SOCKET} sess=${5:-$FLEET_SESSION} cmd pane
+  local id=$1 kind=$2 dir=$3 sock=${4:-$FLEET_SOCKET} sess=${5:-$FLEET_SESSION} pane
+  pane=$(spawn_window "$id" "$kind" "$dir" "$sock" "$sess") || return 1
+  wait_workers "$sock" "$id|$pane|$kind"
+}
+
+# 只開 window、送啟動指令、寫 registry,**不等它 ready**(這步很快)。
+# 印出 pane id 給呼叫端。
+spawn_window() {
+  local id=$1 kind=$2 dir=$3 sock=$4 sess=$5 cmd pane
   cmd=$(signals_get "$kind" command)
   [ -n "$cmd" ] || { fleet_err "adapters/$kind.conf 沒有定義 command"; return 1; }
   # -P -F 取回**穩定 pane id**。舊版登記 session:window 名稱,window 改名或重排就送錯人。
   pane=$(tmux -L "$sock" new-window -t "$sess" -n "$id" -c "$dir" -P -F '#{pane_id}') \
     || { fleet_err "$id: 開 window 失敗"; return 1; }
   tmux -L "$sock" send-keys -t "$pane" "$cmd" Enter
-  printf '  %s%-6s%s %-8s %s ... ' "$c_ylw" "$id" "$c_rst" "$cmd" "$dir"
-  if wait_ready "$sock" "$pane" "$kind"; then
-    reg_add "$id" "$sock" "$pane" "$kind"
-    printf '%sready%s (%s)\n' "$c_grn" "$c_rst" "$pane"
-  else
-    reg_add "$id" "$sock" "$pane" "$kind"
-    printf '%s逾時%s (%s;tmux -L %s attach 看看)\n' "$c_red" "$c_rst" "$pane" "$sock"
-  fi
+  # 先登記:next_id 靠 registry 遞增,不先寫下一隻會拿到同一個 id
+  reg_add "$id" "$sock" "$pane" "$kind"
+  printf '%s' "$pane"
+}
+
+# 一起等一批 worker 起來。參數是 `id|pane|kind` 一個一個傳。
+#
+# **不要退回「開一隻等一隻」。** CLI 冷啟動(載入專案、信任提示)動輒十幾秒,
+# 逐隻等的話總時間是各自啟動時間的**總和**——開 5 隻要等一分多鐘,
+# 而且畫面卡在那裡什麼都沒有,看起來像當掉。並行等之後總時間約等於
+# 「最慢的那一隻」,而且可以邊等邊回報誰好了。
+wait_workers() {
+  local sock=$1 spec id pane kind scr round=0 left done_ids=' '
+  shift
+  [ $# -gt 0 ] || return 0
+  printf '  %s等 %s 隻啟動中%s' "$c_dim" "$#" "$c_rst"
+  while [ "$round" -lt 80 ]; do
+    left=0
+    for spec in "$@"; do
+      id=${spec%%|*}
+      case "$done_ids" in *" $id "*) continue ;; esac
+      pane=${spec#*|}; pane=${pane%%|*}
+      kind=${spec##*|}
+      scr=$(tmux -L "$sock" capture-pane -p -t "$pane" 2>/dev/null || true)
+      # 首次進新目錄的信任提示,自動按 Enter 過
+      if pane_trust "$kind" "$scr"; then
+        tmux -L "$sock" send-keys -t "$pane" Enter 2>/dev/null || true
+        left=$((left + 1))
+        continue
+      fi
+      if pane_ready "$kind" "$scr"; then
+        done_ids="$done_ids$id "
+        printf '\n  %s%-6s%s %-8s %sready%s (%s)' \
+          "$c_ylw" "$id" "$c_rst" "$kind" "$c_grn" "$c_rst" "$pane"
+      else
+        left=$((left + 1))
+      fi
+    done
+    [ "$left" -eq 0 ] && { printf '\n'; return 0; }
+    sleep 0.5
+    round=$((round + 1))
+  done
+  printf '\n'
+  for spec in "$@"; do
+    id=${spec%%|*}
+    case "$done_ids" in *" $id "*) continue ;; esac
+    pane=${spec#*|}; pane=${pane%%|*}
+    printf '  %s%-6s%s %s逾時%s (%s;fleet attach %s 看看卡在哪)\n' \
+      "$c_ylw" "$id" "$c_rst" "$c_red" "$c_rst" "$pane" "$sock"
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -278,12 +329,13 @@ socket_session() {
 }
 
 cmd_up() {
-  local nc=2 nx=1 dir="$FLEET_DEFAULT_DIR" i sock
+  local nc=2 nx=1 dir="$FLEET_DEFAULT_DIR" i sock attach=1 specs id pane
   while [ $# -gt 0 ]; do
     case "$1" in
       --cc) nc=$2; shift 2 ;;
       --cx) nx=$2; shift 2 ;;
       -C | --dir) dir=$2; shift 2 ;;
+      --no-attach) attach=0; shift ;;
       *) fleet_die "up: 未知參數 $1" ;;
     esac
   done
@@ -298,16 +350,39 @@ cmd_up() {
 
   fleet_info "新開艦隊(socket=$sock,目錄=$dir)"
   tmux -L "$sock" new-session -d -s "$FLEET_SESSION" -n commander -c "$dir" -x 220 -y 55
-  [ "$nc" -gt 0 ] && for i in $(seq 1 "$nc"); do spawn_worker "$(next_id cc)" cc "$dir" "$sock"; done
-  [ "$nx" -gt 0 ] && for i in $(seq 1 "$nx"); do spawn_worker "$(next_id cx)" cx "$dir" "$sock"; done
+
+  # 先把 window 全開起來,再一起等——理由見 wait_workers 的註解
+  specs=''
+  [ "$nc" -gt 0 ] && for i in $(seq 1 "$nc"); do
+    id=$(next_id cc); pane=$(spawn_window "$id" cc "$dir" "$sock" "$FLEET_SESSION") \
+      && specs="$specs $id|$pane|cc"
+  done
+  [ "$nx" -gt 0 ] && for i in $(seq 1 "$nx"); do
+    id=$(next_id cx); pane=$(spawn_window "$id" cx "$dir" "$sock" "$FLEET_SESSION") \
+      && specs="$specs $id|$pane|cx"
+  done
+  # shellcheck disable=SC2086  # specs 是自己組的空白分隔清單,要斷詞
+  wait_workers "$sock" $specs
+
   echo
-  if [ "$sock" = "$FLEET_SOCKET" ]; then
-    fleet_info "完成。fleet ls 看清單、fleet attach 進去看。"
-  else
-    fleet_info "完成。fleet ls 看清單、fleet attach $sock 進去看。"
-  fi
   ensure_watcher
   readiness_hint
+  echo
+
+  # 開完直接帶進去。detached session 對使用者來說就是「什麼都沒發生」——
+  # 他剛開了 5 個 AI 卻看不到任何一個,只能自己去查要 attach 哪個 socket。
+  # 已經在 tmux 裡 / 不是真終端(CI、腳本)就只印指令,不強行 attach。
+  if [ "$attach" = 0 ]; then
+    fleet_info "完成。進去看:fleet attach $sock"
+  elif [ -n "${TMUX:-}" ]; then
+    fleet_info "完成。你已在 tmux 裡,用獨立終端進去看:tmux -L $sock attach -t $FLEET_SESSION"
+  elif [ ! -t 1 ]; then
+    fleet_info "完成。進去看:fleet attach $sock"
+  else
+    fleet_info "完成,進入艦隊畫面(離開用 Ctrl-b d,worker 會繼續跑)"
+    sleep 1
+    exec tmux -L "$sock" attach -t "$FLEET_SESSION"
+  fi
 }
 
 cmd_add() {
@@ -348,8 +423,22 @@ cmd_add() {
 # 開完艦隊卻忘了啟動 watcher,是這套工具最常見的「看起來都好但根本沒人叫你」。
 # 既然 fleet up / add 就是在開工,watcher 沒跑就直接幫他起來——這件事沒有
 # 「使用者可能不想要」的情境:不想被通知的人不會去開艦隊。
+# watcher 在跑嗎。
+#
+# **不可以寫成 `... status | head -1 | grep -q 運作中`。**
+# 這支腳本開了 set -o pipefail:head -1 讀完一行就關掉管線,fleet-watcher
+# 收到 SIGPIPE 以 141 結束,pipefail 就讓整條管線回 141——即使 grep 有比中。
+# 症狀是 watcher 明明在跑卻一直說「沒在跑」,然後 start 回你「已在跑」。
+# 先把輸出收進變數再比對,完全不碰管線。
+watcher_running() {
+  local out
+  out=$("$LIBEXEC/fleet-watcher" status 2>/dev/null) || true
+  case "$out" in *運作中*) return 0 ;; esac
+  return 1
+}
+
 ensure_watcher() {
-  "$LIBEXEC/fleet-watcher" status 2>/dev/null | head -1 | grep -q '運作中' && return 0
+  watcher_running && return 0
   fleet_info "watcher 沒在跑,順手幫你啟動:"
   "$LIBEXEC/fleet-watcher" start || fleet_warn "watcher 啟動失敗,請自己跑一次 fleet watch start 看錯誤訊息"
   return 0
@@ -366,7 +455,7 @@ readiness_hint() {
     printf '    tmux display -p "#{pane_id}"\n'
     printf '    fleet commander <印出來的 %%NN>\n'
   fi
-  if ! "$LIBEXEC/fleet-watcher" status 2>/dev/null | head -1 | grep -q '運作中'; then
+  if ! watcher_running; then    # 不要改回管線寫法,理由見 watcher_running
     missing=1
     fleet_warn "watcher 沒在跑 → 回報閉環是關著的:"
     printf '    fleet watch start\n'
@@ -675,6 +764,7 @@ ${c_grn}接管既有 pane(推薦,不用重開)${c_rst}
 
 ${c_grn}新開 worker(獨立 socket:$FLEET_SOCKET)${c_rst}
   fleet up [--cc N] [--cx M] [-C dir]  預設 2 claude + 1 codex;已有一組就自動再開獨立的一組
+                                       開完直接進去看(--no-attach 可關掉)
   fleet add <kind> [-n N] [dir]        動態增援 N 隻(預設 1),加到最近那一組
   fleet attach [socket]                進去看;有多組時會列出來讓你選
   fleet down [socket...] [-y]          收攤:預設收掉全部新開的;接管的永不 kill
