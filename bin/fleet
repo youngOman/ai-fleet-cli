@@ -181,19 +181,51 @@ next_id() {
 
 spawn_worker() {
   local id=$1 kind=$2 dir=$3 sock=${4:-$FLEET_SOCKET} sess=${5:-$FLEET_SESSION} pane
-  pane=$(spawn_window "$id" "$kind" "$dir" "$sock" "$sess") || return 1
+  pane=$(spawn_pane "$id" "$kind" "$dir" "$sock" "$sess:$WORKER_WINDOW") || return 1
   wait_workers "$sock" "$id|$pane|$kind"
 }
 
-# 只開 window、送啟動指令、寫 registry,**不等它 ready**(這步很快)。
+# worker 全部放在**同一個 window 的多個 pane**,用 main-vertical 排版:
+# 左邊一大格、其餘小格疊在右邊。
+#
+# 舊做法是一隻 worker 一個 window,而 session 的第一個 window 是個沒人用的
+# 空 shell(commander)——attach 進去只看到那個空殼,worker 全躲在別的 window,
+# 看起來像「開了半天什麼都沒開起來」。這是實際使用時第一個被抱怨的點。
+WORKER_WINDOW=fleet
+
+# 左邊主格佔的寬度。tmux 3.1 以後才吃百分比,舊版會靜默失敗,不影響其他部分。
+: "${FLEET_MAIN_PANE_WIDTH:=60%}"
+
+apply_layout() {
+  local sock=$1 target=$2
+  # 每格上緣顯示 worker id,不然一堆 claude 畫面長得一模一樣分不出誰是誰
+  tmux -L "$sock" set-window-option -t "$target" pane-border-status top 2>/dev/null || true
+  tmux -L "$sock" set-window-option -t "$target" pane-border-format ' #{pane_title} ' 2>/dev/null || true
+  tmux -L "$sock" set-window-option -t "$target" main-pane-width "$FLEET_MAIN_PANE_WIDTH" 2>/dev/null || true
+  tmux -L "$sock" select-layout -t "$target" main-vertical 2>/dev/null || true
+}
+
+# 只開 pane、送啟動指令、寫 registry,**不等它 ready**(這步很快)。
+# reuse 非空時直接用那個既有 pane(給第一隻用,免得留下空 shell)。
 # 印出 pane id 給呼叫端。
-spawn_window() {
-  local id=$1 kind=$2 dir=$3 sock=$4 sess=$5 cmd pane
+spawn_pane() {
+  local id=$1 kind=$2 dir=$3 sock=$4 target=$5 reuse=${6:-} cmd pane
   cmd=$(signals_get "$kind" command)
   [ -n "$cmd" ] || { fleet_err "adapters/$kind.conf 沒有定義 command"; return 1; }
+  if [ -n "$reuse" ]; then
+    pane=$reuse
+  else
+    # 每切一格就重排一次,不然切到第四、五格會因為「沒空間了」而失敗
+    pane=$(tmux -L "$sock" split-window -t "$target" -c "$dir" -P -F '#{pane_id}' 2>/dev/null) || pane=''
+    if [ -z "$pane" ]; then
+      # 真的塞不下就退回開新 window,至少 worker 還是起得來
+      pane=$(tmux -L "$sock" new-window -t "$target" -n "$id" -c "$dir" -P -F '#{pane_id}') \
+        || { fleet_err "$id: 開 pane 失敗"; return 1; }
+    fi
+  fi
   # -P -F 取回**穩定 pane id**。舊版登記 session:window 名稱,window 改名或重排就送錯人。
-  pane=$(tmux -L "$sock" new-window -t "$sess" -n "$id" -c "$dir" -P -F '#{pane_id}') \
-    || { fleet_err "$id: 開 window 失敗"; return 1; }
+  tmux -L "$sock" select-pane -t "$pane" -T "$id" 2>/dev/null || true
+  apply_layout "$sock" "$target"
   tmux -L "$sock" send-keys -t "$pane" "$cmd" Enter
   # 先登記:next_id 靠 registry 遞增,不先寫下一隻會拿到同一個 id
   reg_add "$id" "$sock" "$pane" "$kind"
@@ -329,7 +361,7 @@ socket_session() {
 }
 
 cmd_up() {
-  local nc=2 nx=1 dir="$FLEET_DEFAULT_DIR" i sock attach=1 specs id pane
+  local nc=2 nx=1 dir="$FLEET_DEFAULT_DIR" i sock attach=1 specs id pane first win
   while [ $# -gt 0 ]; do
     case "$1" in
       --cc) nc=$2; shift 2 ;;
@@ -349,18 +381,25 @@ cmd_up() {
   fi
 
   fleet_info "新開艦隊(socket=$sock,目錄=$dir)"
-  tmux -L "$sock" new-session -d -s "$FLEET_SESSION" -n commander -c "$dir" -x 220 -y 55
+  # -P -F 直接取回第一個 pane:第一隻 worker 就住在這格,不留空 shell
+  first=$(tmux -L "$sock" new-session -d -s "$FLEET_SESSION" -n "$WORKER_WINDOW" \
+    -c "$dir" -x 220 -y 55 -P -F '#{pane_id}') \
+    || fleet_die "開 tmux session 失敗(socket=$sock)"
+  win="$FLEET_SESSION:$WORKER_WINDOW"
 
-  # 先把 window 全開起來,再一起等——理由見 wait_workers 的註解
+  # 先把 pane 全開起來,再一起等——理由見 wait_workers 的註解
   specs=''
   [ "$nc" -gt 0 ] && for i in $(seq 1 "$nc"); do
-    id=$(next_id cc); pane=$(spawn_window "$id" cc "$dir" "$sock" "$FLEET_SESSION") \
-      && specs="$specs $id|$pane|cc"
+    id=$(next_id cc)
+    pane=$(spawn_pane "$id" cc "$dir" "$sock" "$win" "$first") \
+      && { specs="$specs $id|$pane|cc"; first=''; }
   done
   [ "$nx" -gt 0 ] && for i in $(seq 1 "$nx"); do
-    id=$(next_id cx); pane=$(spawn_window "$id" cx "$dir" "$sock" "$FLEET_SESSION") \
-      && specs="$specs $id|$pane|cx"
+    id=$(next_id cx)
+    pane=$(spawn_pane "$id" cx "$dir" "$sock" "$win" "$first") \
+      && { specs="$specs $id|$pane|cx"; first=''; }
   done
+  apply_layout "$sock" "$win"
   # shellcheck disable=SC2086  # specs 是自己組的空白分隔清單,要斷詞
   wait_workers "$sock" $specs
 
@@ -386,7 +425,7 @@ cmd_up() {
 }
 
 cmd_add() {
-  local kind=${1:-} n=1 dir="" i sock="" sess
+  local kind=${1:-} n=1 dir="" i sock="" sess reuse win specs id pane
   shift 2>/dev/null || true
   [ -n "$kind" ] \
     || fleet_die "用法:fleet add <kind> [-n 幾隻] [目錄];可用的 kind:$(signals_kinds | tr '\n' ' ')"
@@ -410,12 +449,23 @@ cmd_add() {
     sock=$(newest_spawn_socket) || sock="$FLEET_SOCKET"
   fi
   sess=$(socket_session "$sock")
-  tmux -L "$sock" has-session -t "$sess" 2>/dev/null \
-    || tmux -L "$sock" new-session -d -s "$sess" -n commander -c "$dir" -x 220 -y 55
+  reuse=''
+  if ! tmux -L "$sock" has-session -t "$sess" 2>/dev/null; then
+    reuse=$(tmux -L "$sock" new-session -d -s "$sess" -n "$WORKER_WINDOW" \
+      -c "$dir" -x 220 -y 55 -P -F '#{pane_id}') || fleet_die "開 tmux session 失敗"
+  fi
+  win="$sess:$WORKER_WINDOW"
+  tmux -L "$sock" list-panes -t "$win" >/dev/null 2>&1 || win="$sess"
   [ "$sock" = "$FLEET_SOCKET" ] || fleet_info "加到 socket=$sock 這一組"
+  specs=''
   for i in $(seq 1 "$n"); do
-    spawn_worker "$(next_id "$kind")" "$kind" "$dir" "$sock" "$sess"
+    id=$(next_id "$kind")
+    pane=$(spawn_pane "$id" "$kind" "$dir" "$sock" "$win" "$reuse") \
+      && { specs="$specs $id|$pane|$kind"; reuse=''; }
   done
+  apply_layout "$sock" "$win"
+  # shellcheck disable=SC2086  # specs 是自己組的空白分隔清單,要斷詞
+  wait_workers "$sock" $specs
   ensure_watcher
   readiness_hint
 }
