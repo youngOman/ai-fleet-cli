@@ -261,6 +261,31 @@ check_dirs() {
   check_dir_writable "profile 目錄" "$FLEET_PROFILE_DIR"
   check_dir_writable "報告目錄" "$FLEET_REPORTS"
   check_dir_writable "派工單目錄" "$FLEET_TASKS"
+  check_reports_dir_shared
+}
+
+# 兩個 profile 共用同一個報告目錄 → 每份報告會被通知兩次。
+#
+# 這不是 bug 是取捨:watcher 會通知**所有**新報告,包含檔名對不上自己 registry
+# 的那些(worker 欄顯示 `-`)。因為「寧可多通知也不要漏掉報告」——過濾掉對不上的
+# 就等於讓命名不合慣例的報告永遠沒人知道。代價就是多艦隊共用目錄會收到雙份。
+#
+# 各 profile 的 watcher 啟動時會把自己盯的目錄寫進 profiles/<名>/reports-dir。
+check_reports_dir_shared() {
+  local d name theirs found=""
+  [ -d "$FLEET_HOME/profiles" ] || return 0
+  for d in "$FLEET_HOME"/profiles/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    [ "$name" = "$FLEET_PROFILE" ] && continue
+    theirs=$(cat "$d/reports-dir" 2>/dev/null) || continue
+    [ "$theirs" = "$FLEET_REPORTS" ] || continue
+    found="$found $name"
+  done
+  [ -n "$found" ] || return 0
+  sus "報告目錄與其他 profile 共用:$(printf '%s' "$found" | sed 's/^ //')"
+  hint "每份報告會被每個 watcher 各通知一次(你會收到重複的)"
+  cmd "export FLEET_REPORTS=$(tilde "$FLEET_REPORTS")-${FLEET_PROFILE}   # 在切到該 profile 的那個 shell 裡"
 }
 
 # ---------------------------------------------------------------------------

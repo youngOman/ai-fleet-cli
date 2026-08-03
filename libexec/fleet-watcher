@@ -195,6 +195,11 @@ cmd_daemon() {
   fleet_ensure_dirs
   mkdir -p "$FLEET_REPORTS" 2>/dev/null || true
   printf '%s\n' "$$" > "$FLEET_PIDFILE"
+  # 記下這個 profile 實際在盯哪個報告目錄,讓 fleet doctor 能偵測
+  # 「兩個 profile 共用同一個報告目錄」——那會讓每份報告被通知兩次
+  # (每個 watcher 都會通知**所有**新報告,包含不是自己 registry 裡的 worker 交的;
+  #  這是刻意的,寧可多通知也不要漏掉報告)。
+  printf '%s\n' "$FLEET_REPORTS" > "$FLEET_PROFILE_DIR/reports-dir"
   trap 'if [ "$(cat "$FLEET_PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$FLEET_PIDFILE"; fi; exit 0' INT TERM
   fleet_log info watcher-start "pid=$$" "profile=$FLEET_PROFILE" "reports=$FLEET_REPORTS"
 
