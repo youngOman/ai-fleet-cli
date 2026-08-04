@@ -793,7 +793,11 @@ cmd_profile() {
       [ -d "$d" ] || continue
       printf '  %s\n' "$(basename "$d")"
     done
-    printf '%s切換方式:export FLEET_PROFILE=<名稱>(每個 profile 有自己的 registry / 指揮官 / watcher)%s\n' "$c_dim" "$c_rst"
+    printf '%s\n' ""
+    printf '%s多數人只需要一個(就是 default),開新艦隊直接 fleet up 就好,不必碰這個。%s\n' "$c_dim" "$c_rst"
+    printf '%sprofile 是「整套帳本」:自己的成員名單、自己的指揮官座位、自己的報告通知記錄。%s\n' "$c_dim" "$c_rst"
+    printf '%s只有想把兩批工作完全隔開(例如公司 / 接案,連通知都不要混)才需要第二套:%s\n' "$c_dim" "$c_rst"
+    printf '    export FLEET_PROFILE=<名稱>\n'
     return 0
   fi
   printf '%s' "$name" | grep -qE '^[A-Za-z0-9_-]+$' || fleet_die "profile 名只能用英數 _ -"
@@ -857,12 +861,11 @@ ${c_grn}接管既有 pane(推薦,不用重開)${c_rst}
   fleet rename <舊> <新>               改成看得懂的名字
   fleet forget <id>                    解除登記(不 kill pane)
 
-${c_grn}新開 worker(獨立 socket:$FLEET_SOCKET)${c_rst}
-  fleet up [--cc N] [--cx M] [-C dir]  預設 2 claude + 1 codex;已有一組就自動再開獨立的一組
-                                       開完直接進去看(--no-attach 可關掉)
-  fleet add <kind> [-n N] [dir]        動態增援 N 隻(預設 1),加到最近那一組
-  fleet attach [socket]                進去看;有多組時會列出來讓你選
-  fleet down [socket] [-y]             收攤:多組時會要你指名(--all 全收);接管的永不 kill
+${c_grn}新開一組艦隊(每組互不影響,開幾組都可以)${c_rst}
+  fleet up [--cc N] [--cx M] [-C dir]  開一組新的:預設 2 claude + 1 codex,開完直接帶你進去
+  fleet add <kind> [-n N] [dir]        往最近那一組再加幾隻(開 pane + 自動登記,一步到位)
+  fleet attach [組名]                  進去看某一組;沒指定且有多組時會列出來
+  fleet down [組名] [-y]               收掉某一組;接管的 pane 永不 kill
 
 ${c_grn}回報閉環(worker 做完自動叫醒指揮官)${c_rst}
   fleet commander [<%NN>] [socket]     設定／顯示指揮官 pane
@@ -883,7 +886,6 @@ ${c_grn}派工 / 觀察${c_rst}
 ${c_grn}維運${c_rst}
   fleet doctor                         健檢
   fleet config                         顯示生效中的設定與來源
-  fleet profile [<名稱>]               列出／建立艦隊 profile
   fleet gc                             清理狀態檔裡的孤兒記錄
   fleet version
 

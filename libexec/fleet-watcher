@@ -245,6 +245,39 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# 一輪一把鎖:整輪(規劃 → 送出 → 記帳)必須互斥
+# ---------------------------------------------------------------------------
+# 迴圈頂端的 pid 所有權自檢**不足以**防止重複通知。實測時序:
+#   t=0.0  舊 watcher 看到新報告,開始送(send_verified 內含 sleep,約 2 秒)
+#   t=1.2  新 watcher 起來,搶下 pid 檔,自己也跑一輪
+#          → 這份報告還沒被記帳,所以它也看到、也送了一次
+#   t=2.0  舊的送完才記帳
+# 結果同一個單號被送兩次(已在真實 watch.log 觀察到,也重現過)。
+#
+# 只在送訊前多檢查一次所有權沒有用——新那隻**確實**是當班的,它的檢查會通過。
+# 要擋的是「兩隻同時在同一輪」,所以鎖要包住整輪。
+# 拿不到鎖就整輪跳過,不記帳,下一輪再說(通知不會遺失)。
+round_lock_acquire() {
+  local d="$FLEET_LOCKDIR/round.lock" owner
+  mkdir "$d" 2>/dev/null && { printf '%s\n' "$$" > "$d/pid"; return 0; }
+  # 孤兒鎖:持有者在送訊途中被 kill 會留下鎖,不處理的話 watcher 永遠不動作
+  owner=$(cat "$d/pid" 2>/dev/null)
+  if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+    rm -rf "$d"
+    mkdir "$d" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$d/pid"
+    fleet_log warn round-lock-stolen "from=${owner:-unknown}"
+    return 0
+  fi
+  return 1
+}
+round_lock_release() {
+  local d="$FLEET_LOCKDIR/round.lock"
+  [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] && rm -rf "$d"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # daemon
 # ---------------------------------------------------------------------------
 cmd_daemon() {
@@ -256,7 +289,7 @@ cmd_daemon() {
   # (每個 watcher 都會通知**所有**新報告,包含不是自己 registry 裡的 worker 交的;
   #  這是刻意的,寧可多通知也不要漏掉報告)。
   printf '%s\n' "$FLEET_REPORTS" > "$FLEET_PROFILE_DIR/reports-dir"
-  trap 'if [ "$(cat "$FLEET_PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$FLEET_PIDFILE"; fi; exit 0' INT TERM
+  trap 'round_lock_release; if [ "$(cat "$FLEET_PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$FLEET_PIDFILE"; fi; exit 0' INT TERM
   fleet_log info watcher-start "pid=$$" "profile=$FLEET_PROFILE" "reports=$FLEET_REPORTS"
 
   while :; do
@@ -264,8 +297,11 @@ cmd_daemon() {
     # 這讓 `fleet watch start` 有「換班」語意——新的一起來,舊的自己走,
     # 保證同時只有一隻在送通知(兩隻會把每則通知送兩遍)。
     [ "$(cat "$FLEET_PIDFILE" 2>/dev/null)" = "$$" ] || break
-    check_reports
-    patrol_workers
+    if round_lock_acquire; then
+      check_reports
+      patrol_workers
+      round_lock_release
+    fi
     sleep "$FLEET_POLL_SECS"
   done
 
