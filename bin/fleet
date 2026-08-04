@@ -247,7 +247,12 @@ apply_layout() {
   local sock=$1 target=$2
   # 每格上緣顯示 worker id,不然一堆 claude 畫面長得一模一樣分不出誰是誰
   tmux -L "$sock" set-window-option -t "$target" pane-border-status top 2>/dev/null || true
-  tmux -L "$sock" set-window-option -t "$target" pane-border-format ' #{pane_title} ' 2>/dev/null || true
+  # 不能用 #{pane_title}:TUI 會把 pane 標題改成自己的
+  # (claude 設成「✳ Claude Code」、codex 設成目錄名),於是每格看起來都一樣,
+  # 「標上 id 才分得出誰是誰」這件事等於沒做。
+  # pane 層級的 user option 是 tmux 自己的資料,TUI 碰不到。
+  tmux -L "$sock" set-window-option -t "$target" pane-border-format \
+    ' #{?@fleet_id,#{@fleet_id},#{pane_title}} ' 2>/dev/null || true
   tmux -L "$sock" set-window-option -t "$target" main-pane-width "$FLEET_MAIN_PANE_WIDTH" 2>/dev/null || true
   tmux -L "$sock" select-layout -t "$target" main-vertical 2>/dev/null || true
 }
@@ -296,6 +301,8 @@ spawn_pane() {
   fi
   # -P -F 取回**穩定 pane id**。舊版登記 session:window 名稱,window 改名或重排就送錯人。
   tmux -L "$sock" select-pane -t "$pane" -T "$id" 2>/dev/null || true
+  # 真正拿來顯示的是這個(見 apply_layout 的說明)
+  tmux -L "$sock" set -p -t "$pane" @fleet_id "$id" 2>/dev/null || true
   apply_layout "$sock" "$target"
   enforce_min_pane_height "$sock" "$target" "$pane" "$id"
   tmux -L "$sock" send-keys -t "$pane" "$cmd" Enter
