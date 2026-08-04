@@ -396,17 +396,15 @@ check_commander() {
 
   if [ ! -f "$FLEET_COMMANDER_FILE" ]; then
     bad "還沒設定指揮官 pane → watcher 不知道要把通知送給誰(整個回報閉環等於沒開)"
-    hint "在你(指揮官)坐的那一格終端裡跑第一行,把印出來的 %NN 填進第二行:"
-    cmd "tmux display -p '#{pane_id}'"
-    cmd "fleet commander <上面印出來的 %NN>"
+    hint "在你(指揮官)坐的那一格終端裡跑:"
+    cmd "fleet commander here        # 在你要當指揮官的那格終端裡跑"
     return
   fi
 
   line=$(head -n 1 "$FLEET_COMMANDER_FILE" 2>/dev/null || true)
   if [ -z "$line" ]; then
     bad "指揮官設定檔是空的:$(tilde "$FLEET_COMMANDER_FILE")"
-    cmd "tmux display -p '#{pane_id}'"
-    cmd "fleet commander <上面印出來的 %NN>"
+    cmd "fleet commander here        # 在你要當指揮官的那格終端裡跑"
     return
   fi
 
@@ -422,8 +420,7 @@ check_commander() {
 
   if ! valid_pane "$pane"; then
     bad "指揮官 pane「${pane}」不是 %NN 形式"
-    cmd "tmux display -p '#{pane_id}'"
-    cmd "fleet commander <上面印出來的 %NN>"
+    cmd "fleet commander here        # 在你要當指揮官的那格終端裡跑"
     return
   fi
 
@@ -436,8 +433,7 @@ check_commander() {
     ok "指揮官:$pane($(sock_label "$sock"))"
   else
     bad "指揮官 pane $pane 已經不在了($(sock_label "$sock"))→ 通知會全部靜默失敗"
-    cmd "tmux display -p '#{pane_id}'"
-    cmd "fleet commander <上面印出來的 %NN>"
+    cmd "fleet commander here        # 在你要當指揮官的那格終端裡跑"
   fi
 }
 

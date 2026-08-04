@@ -62,7 +62,12 @@ LIBEXEC="$FLEET_LIBDIR/libexec"
 # ---------------------------------------------------------------------------
 
 cmd_discover() {
-  fleet_info "掃描現有 pane:"
+  local adopt_all=0
+  case "${1:-}" in
+    --adopt | --adopt-all | -a) adopt_all=1 ;;
+  esac
+  [ "$adopt_all" = 1 ] && fleet_info "掃描並直接接管所有找到的 pane:" \
+    || fleet_info "掃描現有 pane:"
   local tmp sock pane content kind cwd n=0
   tmp=$(mktemp "${TMPDIR:-/tmp}/fleet.XXXXXX") || return 1
   for sock in "-" "$FLEET_SOCKET"; do
@@ -83,9 +88,26 @@ EOF
     return 0
   fi
 
-  printf '%s  %-4s %-8s %-30s %s%s\n' "$c_dim" "型" "pane" "目錄(用這個認)" "建議接管指令" "$c_rst"
-  local sid disp
+  [ "$adopt_all" = 1 ] \
+    || printf '%s  %-4s %-8s %-30s %s%s\n' "$c_dim" "型" "pane" "目錄(用這個認)" "建議接管指令" "$c_rst"
+  local sid disp taken=0 known=0 csock cpane
+  csock=$(commander_socket 2>/dev/null || true)
+  cpane=$(commander_pane 2>/dev/null || true)
   while IFS=$'\t' read -r sock pane kind cwd; do
+    # 指揮官那格是**你自己**,不是 worker。接管它會變成 fleet 對著你自己
+    # 派工、還把你的畫面當成 worker 狀態在判斷忙碌。
+    if [ -n "$cpane" ] && [ "$pane" = "$cpane" ] && [ "$sock" = "$csock" ]; then
+      printf '  %s%-4s%s %-8s %s← 你自己(指揮官),跳過%s\n' \
+        "$c_dim" "$kind" "$c_rst" "$pane" "$c_dim" "$c_rst"
+      continue
+    fi
+    # 已經登記過的就跳過,重跑不會製造重複
+    if reg_id_of_pane "$sock" "$pane" >/dev/null 2>&1; then
+      known=$((known + 1))
+      [ "$adopt_all" = 1 ] && printf '  %s%-4s%s %-8s %s已登記為 %s%s\n' \
+        "$c_dim" "$kind" "$c_rst" "$pane" "$c_dim" "$(reg_id_of_pane "$sock" "$pane")" "$c_rst"
+      continue
+    fi
     n=$((n + 1))
     sid="${kind}${n}"
     while reg_get "$sid" >/dev/null 2>&1; do
@@ -93,12 +115,35 @@ EOF
       sid="${kind}${n}"
     done
     disp=$(fleet_tildify "$cwd")
-    printf '  %s%-4s%s %-8s %-30s %sfleet adopt %s %s %s%s\n' \
-      "$c_ylw" "$kind" "$c_rst" "$pane" "$(printf '%s' "$disp" | cut -c1-30)" \
-      "$c_grn" "$sid" "$pane" "$sock" "$c_rst"
+    if [ "$adopt_all" = 1 ]; then
+      if reg_add "$sid" "$sock" "$pane" "$kind"; then
+        taken=$((taken + 1))
+        printf '  %s%-4s%s %-8s %-30s %s→ 已接管為 %s%s\n' \
+          "$c_ylw" "$kind" "$c_rst" "$pane" "$(printf '%s' "$disp" | cut -c1-30)" \
+          "$c_grn" "$sid" "$c_rst"
+      else
+        fleet_warn "  $pane 登記失敗"
+      fi
+    else
+      printf '  %s%-4s%s %-8s %-30s %sfleet adopt %s %s %s%s\n' \
+        "$c_ylw" "$kind" "$c_rst" "$pane" "$(printf '%s' "$disp" | cut -c1-30)" \
+        "$c_grn" "$sid" "$pane" "$sock" "$c_rst"
+    fi
   done < "$tmp"
   rm -f "$tmp"
-  printf '%s  提示:id 換成專案名更好認,例如 fleet adopt linkmind %%12 -%s\n' "$c_dim" "$c_rst"
+
+  if [ "$adopt_all" = 1 ]; then
+    printf '\n'
+    fleet_info "接管了 $taken 隻。名字想改用 fleet rename <舊> <新>,不想要就 fleet forget <id>。"
+    ensure_watcher
+    readiness_hint
+  else
+    if [ "$known" -gt 0 ]; then
+      printf '%s  (另有 %s 個 pane 已經登記過了,fleet ls 看清單)%s\n' "$c_dim" "$known" "$c_rst"
+    fi
+    printf '%s  想全部接管:fleet discover --adopt%s\n' "$c_dim" "$c_rst"
+    printf '%s  id 換成專案名更好認,例如 fleet adopt linkmind %%12 -%s\n' "$c_dim" "$c_rst"
+  fi
 }
 
 cmd_adopt() {
@@ -761,25 +806,57 @@ cmd_reports() {
 # 指揮官 / profile / 設定 / 維運
 # ---------------------------------------------------------------------------
 
+# 我現在人在哪一格?tmux 在每個 pane 裡都塞了 $TMUX_PANE,直接讀就好。
+# 不需要叫使用者去跑 tmux display -p '#{pane_id}' 再把 %NN 抄回來——
+# 那個號碼是 tmux 的內部識別碼,本來就不該讓人用眼睛搬運。
+here_pane() {
+  [ -n "${TMUX_PANE:-}" ] || return 1
+  printf '%s' "$TMUX_PANE"
+}
+
+# 我現在這格屬於哪個 socket?$TMUX 長這樣:<socket 路徑>,<pid>,<session>
+# 預設 socket 的檔名就叫 default,registry 裡記成 "-"。
+here_socket() {
+  local s
+  [ -n "${TMUX:-}" ] || { printf '%s' '-'; return 0; }
+  s=$(basename "${TMUX%%,*}" 2>/dev/null || echo default)
+  [ "$s" = default ] && s='-'
+  printf '%s' "$s"
+}
+
+show_commander() {
+  printf '指揮官:socket=%s pane=%s' "$(commander_socket)" "$(commander_pane)"
+  if pane_exists "$(commander_socket)" "$(commander_pane)"; then
+    printf '  %s(存活)%s\n' "$c_grn" "$c_rst"
+  else
+    printf '  %s(pane 不存在!通知會全部送不到)%s\n' "$c_red" "$c_rst"
+  fi
+}
+
 cmd_commander() {
-  local pane=${1:-} sock=${2:--}
-  if [ -z "$pane" ]; then
-    if [ -f "$FLEET_COMMANDER_FILE" ]; then
-      printf '指揮官:socket=%s pane=%s' "$(commander_socket)" "$(commander_pane)"
-      if pane_exists "$(commander_socket)" "$(commander_pane)"; then
-        printf '  %s(存活)%s\n' "$c_grn" "$c_rst"
-      else
-        printf '  %s(pane 不存在!通知會全部送不到)%s\n' "$c_red" "$c_rst"
-      fi
-    else
-      fleet_warn "還沒設定指揮官。在指揮官那個 pane 裡跑:"
-      printf '    tmux display -p "#{pane_id}"\n'
-      printf '  再把結果餵進來:\n'
-      printf '    fleet commander %%NN\n'
+  local pane=${1:-} sock=${2:-} hp
+
+  # `fleet commander here` / 沒設定過時不帶參數 → 就設成你現在坐的這格
+  if [ -z "$pane" ] || [ "$pane" = here ] || [ "$pane" = me ]; then
+    if [ -z "$pane" ] && [ -f "$FLEET_COMMANDER_FILE" ]; then
+      show_commander
+      printf '%s  想改成你現在這格:fleet commander here%s\n' "$c_dim" "$c_rst"
+      return 0
+    fi
+    if ! hp=$(here_pane); then
+      fleet_err "你現在不在 tmux 裡,抓不到你坐哪一格。"
+      printf '  在你要當指揮官的那格終端裡(必須在 tmux 內)跑:\n'
+      printf '    fleet commander here\n'
       return 1
     fi
+    pane=$hp
+    [ -n "$sock" ] || sock=$(here_socket)
+    commander_set "$pane" "$sock" || return 1
+    fleet_info "指揮官已設成你現在這格($pane)。worker 交報告會叫醒這裡。"
     return 0
   fi
+
+  [ -n "$sock" ] || sock='-'
   commander_set "$pane" "$sock" || return 1
   fleet_info "指揮官已設定:socket=$sock pane=$pane"
 }
@@ -856,7 +933,8 @@ ${c_cyn}fleet${c_rst} — tmux 多 agent 派工台  (v$FLEET_VERSION)
 
 ${c_grn}接管既有 pane(推薦,不用重開)${c_rst}
   fleet discover                       掃現有 worker pane,列出接管指令
-  fleet adopt <id> <%NN> [socket]      接管一個既有 pane(永不 kill)
+  fleet discover --adopt               掃到的全部接管,自動取名(最省事)
+  fleet adopt <名字> <pane> [socket]   單獨接管一格;pane 直接複製 discover 印的那行
   fleet who <id>                       這個 id 是哪個視窗?並在該 session 狀態列閃提示
   fleet rename <舊> <新>               改成看得懂的名字
   fleet forget <id>                    解除登記(不 kill pane)
@@ -868,7 +946,8 @@ ${c_grn}新開一組艦隊(每組互不影響,開幾組都可以)${c_rst}
   fleet down [組名] [-y]               收掉某一組;接管的 pane 永不 kill
 
 ${c_grn}回報閉環(worker 做完自動叫醒指揮官)${c_rst}
-  fleet commander [<%NN>] [socket]     設定／顯示指揮官 pane
+  fleet commander here                 把「你現在坐的這格」設成指揮官(通知送這裡)
+  fleet commander                      顯示目前設定
   fleet watch start|stop|restart|status|log
   fleet task <id> <brief>              派正式任務(送短訊指向 brief,自動附回報協定)
   fleet reports [N]                    列最近 N 份報告

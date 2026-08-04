@@ -152,3 +152,10 @@ commander_set() {
   valid_socket "$sock" || { fleet_err "socket 名怪異,拒絕"; return 1; }
   printf '%s\t%s\n' "$sock" "$pane" > "$FLEET_COMMANDER_FILE"
 }
+
+# 這個 socket+pane 已經登記成哪個 id?沒登記過就 return 1。
+# discover 用來跳過已接管的 pane,重跑不會製造重複登記。
+reg_id_of_pane() {
+  local sock=$1 pane=$2
+  awk -F'\t' -v s="$sock" -v p="$pane" '$2==s && $3==p {print $1; f=1} END{exit !f}' "$FLEET_REG"
+}
