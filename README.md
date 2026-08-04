@@ -16,34 +16,58 @@ worker 做完不會敲你，你就只能一直輪詢「好了沒」，或是掛�
 ## 60 秒示範
 
 ```bash
-# 1. 你已經開好幾個 claude / codex 終端了？直接掃出來
-fleet discover
-#   %12  0:1.0  claude   → fleet adopt cc1 %12
-#   %13  0:1.1  codex    → fleet adopt cx1 %13
+# 1. 開一組新艦隊（預設 2 claude + 1 codex），開完直接把你帶進畫面
+fleet up
 
-# 2. 接管它們（永遠不會 kill 你的 pane）
-fleet adopt cc1 %12
-fleet adopt cx1 %13
+# 2. 告訴 fleet 你（指揮官）坐在哪 —— 在你自己那格終端裡跑
+fleet commander here
 
-# 3. 告訴 fleet 你（指揮官）坐在哪一格
-fleet commander %11
-
-# 4. 啟動回報閉環
-fleet watch start
-
-# 5. 派工：寫好 brief，送短訊指向它
+# 3. 派工：寫好 brief，送短訊指向它
 fleet task cc1 refactor-auth      # 自動找 $FLEET_TASKS/refactor-auth.md
 
-# 6. 看板（不帶參數就是看板）
+# 4. 看板（不帶參數就是看板）
 fleet
 #   id    kind    狀態     ctx    最後活動
 #   cc1   claude  🏃 跑中   68%    Editing src/auth.rs
 #   cx1   codex   😴 閒置   91%    -
 
-# 7. 然後你就可以去做別的事。
+# 5. 然後你就可以去做別的事。
 #    cc1 寫完報告的那一刻，你的輸入框會自己跳出：
 #    📥 cc1 交報告：20260803-1420-cc1-refactor-auth.md (r1754209200)
 ```
+
+已經自己開好一堆 claude / codex 了？不用重開，一行接管全部：
+
+```bash
+fleet discover --adopt        # 掃到的全部接管、自動取名（會跳過你自己那格）
+```
+
+---
+
+## 快速指令
+
+日常九成只會用到這幾行：
+
+| 想幹嘛 | 指令 |
+|---|---|
+| 開一組新艦隊 | `fleet up` |
+| 一組裡再加一隻 | `fleet add cc` ／ `fleet add cx` ／ `fleet add cc -n 3` |
+| 看板 | `fleet` |
+| 跟某一隻講話 | `fleet send <名字> "文字"` |
+| 派正式任務 | `fleet task <名字> <brief>` |
+| 看某一隻的畫面 | `fleet peek <名字>` |
+| 進去艦隊畫面 | `fleet attach` |
+| 收掉一組 | `fleet down <組名>` |
+| 出問題時 | `fleet doctor` |
+
+第一次用多一步 `fleet commander here`（在你自己坐的那格終端裡跑），
+之後 worker 交報告就會自動叫醒你。
+
+**你不需要記 `%NN`。** 那是 tmux 給每格終端的內部編號，
+`fleet commander here` 會自己抓、`fleet discover` 會把指令整行印好給你複製。
+
+多開幾組互不影響 —— 再打一次 `fleet up` 就是全新的一組，
+`fleet ls` 的 `socket` 欄會顯示它屬於哪一組（`agents`、`agents-2`…）。
 
 ---
 
@@ -132,7 +156,8 @@ watcher 巡邏時如果在 worker 畫面上比對到 adapter 定義的攔截框�
 | 指令 | 做什麼 |
 |---|---|
 | `fleet discover` | 掃現有的 claude / codex pane，列出接管指令 |
-| `fleet adopt <id> <pane> [socket]` | 接管既有 pane（**永不 kill**） |
+| `fleet discover --adopt` | 掃到的 pane 全部接管、自動取名（跳過指揮官那格與已登記的） |
+| `fleet adopt <名字> <pane> [socket]` | 單獨接管一格（**永不 kill**）；`pane` 直接複製 `fleet discover` 印的那行 |
 | `fleet who <id>` | 這個 id 是哪個視窗 |
 | `fleet rename <舊> <新>` | 改名 |
 | `fleet forget <id>` | 解除登記（不 kill pane） |
@@ -143,10 +168,10 @@ watcher 巡邏時如果在 worker 畫面上比對到 adapter 定義的攔截框�
 
 | 指令 | 做什麼 |
 |---|---|
-| `fleet up [--cc N] [--cx M] [-C dir]` | 新開一組（跑在獨立 socket）。預設 `--cc 2 --cx 1` |
+| `fleet up [--cc N] [--cx M] [-C dir]` | 新開一組，預設 `--cc 2 --cx 1`。**已有一組就自動再開獨立的一組**，開完直接 attach 進去（`--no-attach` 可關） |
 | `fleet add <kind> [dir]` | 動態增援一隻。`kind` 是 adapter 名（內建 `cc` / `cx`） |
 | `fleet attach` | 進 spawn 出來的 session |
-| `fleet down [-y]` | 收攤：kill 新開的（並清掉它們的登記）；**接管的 pane 與其登記都不動** |
+| `fleet down [組名] [-y]` | 收攤：kill 新開的那組（並清掉登記）；**接管的 pane 與其登記都不動**。多組時會要你指名，`--all` 才全收 |
 
 > `fleet down` 對 adopt 進來的 worker 是**完全不碰**——pane 不 kill，registry 那一列也留著。
 > 想解除登記用 `fleet forget <id>`。
@@ -187,7 +212,8 @@ watcher 巡邏時如果在 worker 畫面上比對到 adapter 定義的攔截框�
 
 | 指令 | 做什麼 |
 |---|---|
-| `fleet commander [<pane>] [socket]` | 設定／顯示指揮官 pane（`socket` 省略＝你日常那個） |
+| `fleet commander here` | 把「你現在坐的這格」設成指揮官（自動抓 `$TMUX_PANE`，不用查 `%NN`） |
+| `fleet commander` | 顯示目前設定 |
 | `fleet profile [<name>]` | 不帶參數＝列出；帶名字＝建立該 profile 並印出切換指令 |
 | `fleet config` | 顯示生效中的設定與其來源（環境變數／設定檔／預設） |
 
@@ -214,6 +240,9 @@ watcher 巡邏時如果在 worker 畫面上比對到 adapter 定義的攔截框�
 | `FLEET_SOCKET` | `agents` | spawn 用的 tmux socket |
 | `FLEET_SESSION` | `fleet` | spawn 用的 tmux session |
 | `FLEET_LIBDIR` | 由 `bin/fleet` 自動推導 | 安裝後的 lib/libexec/adapters 根目錄 |
+| `FLEET_AUTO_FORGET` | `1` | worker 被 exit 掉後自動從 registry 移除（`0` 關閉） |
+| `FLEET_FORGET_STRIKES` | `3` | 連續幾輪確認 pane 不見才移除。tmux server 問不到時一律不算數 |
+| `FLEET_MAIN_PANE_WIDTH` | `60%` | 艦隊畫面左邊主格的寬度（`main-vertical` 版面） |
 | `FLEET_SEND_DELAY` | `1` | 貼字與 Enter 之間的等待秒數 |
 | `FLEET_POLL_SECS` | `3` | watcher 掃描間隔 |
 | `FLEET_STABLE_SECS` | `3` | 報告檔靜置多久才算落地 |
