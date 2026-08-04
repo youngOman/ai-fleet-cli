@@ -112,11 +112,63 @@ check_reports() {
 }
 
 # ---------------------------------------------------------------------------
+# 自動清掉被 exit 掉的 worker
+# ---------------------------------------------------------------------------
+# worker 被使用者 exit 之後,registry 還留著一筆指向不存在 pane 的記錄,
+# fleet ls 標成 NO、看板留一行殭屍、閒置警報也還會對它計算。手動 forget
+# 很容易忘,所以由 watcher 代勞。
+#
+# **但絕對不能只看「pane 還在不在」就 forget。**
+# tmux server 沒在跑的時候,那個 socket 上每一隻都會回「不在」——
+# 筆電睡醒、tmux server 重啟、fleet down 掉另一組的瞬間都會發生。
+# 照著 forget 下去,整個 registry 會被清空,使用者得重新 adopt 每一隻。
+# 兩道保險:
+#   1. **只有在該 socket 的 tmux server 確實活著時才算數**。server 問不到
+#      是「診斷不出來」,不是「pane 死了」。
+#   2. 連續 N 輪都確認不見才動手(預設 3 輪,約 9 秒)。分割視窗、
+#      重排 layout 的瞬間 pane id 可能短暫查不到。
+#
+# 設 FLEET_AUTO_FORGET=0 可以完全關掉。
+: "${FLEET_AUTO_FORGET:=1}"
+: "${FLEET_FORGET_STRIKES:=3}"
+
+# bash 3.2 沒有關聯陣列,用合法變數名模擬計數器。id 已經被 valid_id
+# 限制成 [A-Za-z0-9_-],轉成底線後拿來組變數名是安全的。
+_strike_var() { printf '_FLEET_STRIKE_%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+
+forget_strikes_reset() {
+  local v
+  v=$(_strike_var "$1")
+  eval "$v=0"
+}
+
+reap_if_gone() {
+  local id=$1 sock=$2 pane=$3 v n
+  [ "$FLEET_AUTO_FORGET" = 1 ] || return 0
+
+  # 保險 1:server 問不到就什麼都不做,連計數都不加
+  stmux "$sock" list-sessions >/dev/null 2>&1 || return 0
+
+  # 保險 2:連續 N 輪
+  v=$(_strike_var "$id")
+  eval "n=\${$v:-0}"
+  n=$((n + 1))
+  eval "$v=$n"
+  [ "$n" -ge "$FLEET_FORGET_STRIKES" ] || return 0
+
+  reg_del "$id" || return 0
+  eval "$v=0"
+  fleet_log info worker-reaped id="$id" socket="$sock" pane="$pane" strikes="$n"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # worker 巡邏
 # ---------------------------------------------------------------------------
 patrol_workers() {
   local id kind sock pane screen now busy stuck action rc result tag msg
   local ar_match ar_keys handled
+  # shellcheck disable=SC2034  # 給下面的 reap_if_gone 用
 
   now=$(fleet_now)
   for id in $(reg_ids); do
@@ -124,7 +176,11 @@ patrol_workers() {
     sock=$(wsocket "$id")
     pane=$(wpane "$id")
     [ -n "$pane" ] || continue
-    pane_exists "$sock" "$pane" || continue
+    if ! pane_exists "$sock" "$pane"; then
+      reap_if_gone "$id" "$sock" "$pane"
+      continue
+    fi
+    forget_strikes_reset "$id"
 
     # 只看可見畫面。吃 scrollback 會讓早就消失的 `esc to interrupt` /
     # `Press up to edit queued` 永遠命中 → 閒置警報永遠不發、假卡住警報狂噴。

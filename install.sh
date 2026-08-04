@@ -469,6 +469,14 @@ write_config_template() {
 
 # 通知指揮官之前,要不要先對報告跑一次四節 schema 驗證(0 = 關掉)
 #FLEET_LINT_REPORTS=1
+
+# --- 自動清理 --------------------------------------------------------------
+# worker 被 exit 掉之後,自動把它從 registry 移除(0 = 關掉,改成自己 fleet forget)
+#FLEET_AUTO_FORGET=1
+
+# 連續幾輪都確認 pane 不見了才移除。tmux server 問不到時一律不算數,
+# 所以筆電睡醒 / server 重啟不會把整個 registry 清空
+#FLEET_FORGET_STRIKES=3
 EOF
   good "已寫入設定檔範本(全部註解掉):$f"
 }
