@@ -100,7 +100,7 @@ _fleet() {
         _fleet_cands=(
             mon doctor discover adopt who rename forget ls up add attach down
             send bcast task peek wait reports lint watch commander profile gc
-            config version help
+            config protocol version help
         )
     else
         case "$cmd" in

@@ -52,6 +52,11 @@ OPTIONAL_DIRS="share completion"
 MODE=install
 DRY_RUN=0
 
+# 指揮官 skill 要不要裝進 Claude Code 的 skills 目錄。
+# auto = 只有偵測到該目錄已存在時才裝(存在 = 使用者確實在用 Claude Code)。
+# 對非 Claude Code 使用者,這一步完全不發生,連目錄都不會建。
+INSTALL_SKILL=auto
+
 COPIED=0
 SKIPPED=0
 BACKED=0
@@ -380,6 +385,54 @@ check_source() {
 }
 
 # ---------------------------------------------------------------------------
+# 指揮官 skill(Claude Code)
+# ---------------------------------------------------------------------------
+#
+# 為什麼要裝這個:fleet 的價值一半在 CLI,一半在「指揮官 AI 知道怎麼用它」。
+# 沒有這份 skill,使用者每開一個新 session 都要重新跟 AI 解釋一次
+# 「你是指揮官、可以派工給其他 pane 裡的 AI」。
+#
+# 用 symlink 不用複製:fleet 升級時 skill 內容自動跟著更新,
+# 不會留一份會腐化的副本在 ~/.claude/skills/ 裡。
+#
+# 只在 ~/.claude/skills/ **已經存在**時才裝(auto 模式)——那代表使用者
+# 確實在用 Claude Code。不會為了裝 skill 而去建使用者家目錄下的新結構。
+install_commander_skill() {
+  local skills_dir="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
+  local src="$PREFIX/share/skills/fleet-commander"
+  local dst="$skills_dir/fleet-commander"
+
+  [ "$INSTALL_SKILL" = no ] && return 0
+  [ -f "$SRC_DIR/share/skills/fleet-commander/SKILL.md" ] || return 0
+
+  if [ "$INSTALL_SKILL" = auto ] && [ ! -d "$skills_dir" ]; then
+    return 0     # 不是 Claude Code 使用者,靜默跳過
+  fi
+
+  step "指揮官 skill(Claude Code)"
+
+  # 已經是指向本次安裝的 symlink → 已經最新,不用動
+  if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+    good "已連結,內容隨 fleet 升級自動更新:$(pretty_path "$dst")"
+    return 0
+  fi
+
+  # 已存在但不是我們建的 → 那是使用者自己的東西,絕不覆寫
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    warn "$(pretty_path "${dst}") 已存在而且不是本安裝器建的,不動它。"
+    say  "   要換成 fleet 內建的指揮官 skill,自己決定要不要覆蓋:"
+    say  ""
+    say  "     ln -sfn $(shq "$src") $(shq "${dst}")"
+    return 0
+  fi
+
+  run mkdir -p "$skills_dir" || { warn "無法建立 ${skills_dir}，跳過 skill 安裝"; return 0; }
+  run ln -sfn "$src" "$dst" || { warn "建立 skill symlink 失敗,跳過"; return 0; }
+  did "skill:$(pretty_path "$dst") → $(pretty_path "$src")"
+  [ "$DRY_RUN" = 1 ] || say "   ${C_DIM}下一個 Claude Code session 起,講到派工/艦隊時會自動載入。${C_RST}"
+}
+
+# ---------------------------------------------------------------------------
 # config.env 範本(全部註解掉)
 # ---------------------------------------------------------------------------
 
@@ -545,6 +598,8 @@ do_install() {
   step "設定檔"
   write_config_template "$CONFIG_FILE"
 
+  install_commander_skill
+
   step "驗證安裝"
   if [ "$DRY_RUN" = 1 ]; then
     say "  ${C_DIM}[dry-run]${C_RST} 執行 $BINDIR/fleet version 並檢查離開碼"
@@ -621,7 +676,7 @@ print_post_install() {
 # 印出路徑讓他自己決定。
 
 do_uninstall() {
-  local target
+  local target skill_link
 
   step "解除安裝"
   info "PREFIX:$PREFIX"
@@ -646,6 +701,18 @@ do_uninstall() {
     esac
   else
     info "$BINDIR/fleet 不存在,跳過"
+  fi
+
+  # skill symlink 會指進 PREFIX,PREFIX 刪掉之後它就變成斷掉的連結
+  # (Claude Code 會列出一個載入不了的 skill)。只清「確實指向本次 PREFIX」的那個。
+  skill_link="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}/fleet-commander"
+  if [ -L "$skill_link" ]; then
+    case "$(readlink "$skill_link" 2>/dev/null || true)" in
+      "$PREFIX"/*)
+        run rm -f "$skill_link" || warn "無法移除 ${skill_link}，請自己刪"
+        good "已移除 skill symlink:$skill_link"
+        ;;
+    esac
   fi
 
   if [ -d "$PREFIX" ]; then
@@ -877,6 +944,9 @@ usage() {
 選項:
   --prefix DIR    程式安裝位置(預設 \${XDG_DATA_HOME:-\$HOME/.local/share}/fleet-cli)
   --bindir DIR    fleet 指令的 symlink 位置(預設 \$HOME/.local/bin)
+  --skill         一定要裝指揮官 skill 到 \$HOME/.claude/skills/(Claude Code 用)
+  --no-skill      不要裝指揮官 skill
+                  ${C_DIM}預設是 auto:只有 ~/.claude/skills/ 已存在時才裝${C_RST}
   --uninstall     移除程式本體與 symlink;**保留** \$FLEET_HOME 與 config.env
   --migrate       從舊版個人佈局(${OLD_ROOT})搬 registry / commander 過來,舊檔不刪
   --dry-run       印出所有會做的動作,但什麼都不做(可搭配上面任一模式)
@@ -918,6 +988,8 @@ while [ $# -gt 0 ]; do
       BINDIR=$2; shift 2 ;;
     --bindir=*)
       BINDIR=${1#--bindir=}; shift ;;
+    --skill)     INSTALL_SKILL=yes; shift ;;
+    --no-skill)  INSTALL_SKILL=no; shift ;;
     --uninstall) MODE=uninstall; shift ;;
     --migrate)   MODE=migrate; shift ;;
     --dry-run)   DRY_RUN=1; shift ;;

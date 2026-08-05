@@ -84,6 +84,7 @@ cd ai-fleet-cli
 - 檢查 tmux / python3 版本
 - 建立執行期目錄（`FLEET_HOME`、報告目錄、派工單目錄）
 - 把 `fleet` 裝到你的 PATH
+- 偵測到 `~/.claude/skills/` 就順便裝[指揮官 skill](#指揮官-skillclaude-code)（`--no-skill` 可關）
 
 **它不會改你的 shell rc。**
 需要設環境變數時，它只會把該加的 `export` 指令印出來讓你自己複製貼上——
@@ -222,6 +223,38 @@ watcher 巡邏時如果在 worker 畫面上比對到 adapter 定義的攔截框�
 > export FLEET_PROFILE=work
 > ```
 > 這是刻意的——`fleet` 是短命行程，它改不了呼叫它的那個 shell 的環境。
+
+---
+
+## 指揮官 skill（Claude Code）
+
+fleet 的價值一半在 CLI，一半在「指揮官 AI 知道怎麼用它」。
+沒有這一步，你每開一個新 session 都要重新解釋一次
+「你是指揮官、可以派工給其他 pane 裡的 AI」。
+
+`install.sh` 會在偵測到 `~/.claude/skills/` 時，把
+[`share/skills/fleet-commander/`](share/skills/fleet-commander/SKILL.md)
+**symlink** 過去（不是複製——fleet 升級時 skill 內容自動跟著更新）。
+
+```bash
+./install.sh              # 有 ~/.claude/skills/ 就裝，沒有就完全跳過
+./install.sh --skill      # 一定要裝（目錄不存在也會建）
+./install.sh --no-skill   # 一定不裝
+```
+
+目標路徑已經有東西而且不是安裝器建的 → **絕不覆寫**，只印出手動指令讓你自己決定。
+
+skill 本體只有一頁（開工三件事、派工、看板讀法、三條硬規則），
+刻意不塞完整 SOP。指揮官 AI 需要細節時自己跑：
+
+```bash
+fleet protocol       # 印出完整指揮官協定（= docs/commander-protocol.md）
+```
+
+這樣協定只有一份、不會有副本分岔，skill 也不用寫死安裝路徑。
+
+其他 harness（Codex、Cursor…）沒有 skill 機制的，把
+`fleet protocol` 的輸出貼進該工具的系統提示或 `AGENTS.md` 即可。
 
 ---
 
@@ -371,7 +404,8 @@ trust=trust this folder|Do you trust
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 實作契約：目錄佈局、路徑、`state.json` schema、送訊協定 |
 | [docs/design.md](docs/design.md) | 為什麼這樣設計——各項核心決策的理由與失敗經驗 |
 | [docs/pitfalls.md](docs/pitfalls.md) | **血淚細節**。踩過的每一個坑：症狀／根因／修法。改動前務必讀 |
-| [docs/commander-protocol.md](docs/commander-protocol.md) | 給「指揮官 AI」讀的派工 SOP |
+| [docs/commander-protocol.md](docs/commander-protocol.md) | 給「指揮官 AI」讀的派工 SOP（`fleet protocol` 印同一份） |
+| [share/skills/fleet-commander/SKILL.md](share/skills/fleet-commander/SKILL.md) | Claude Code 用的一頁版指揮官 skill |
 | [docs/migration.md](docs/migration.md) | 從舊版個人 fleet 佈局遷移 |
 
 ---

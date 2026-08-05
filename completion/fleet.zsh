@@ -170,6 +170,7 @@ _fleet() {
     'profile:切換或列出艦隊 profile'
     'gc:清掉失效的報告與 worker 狀態'
     'config:顯示目前生效的設定與來源'
+    'protocol:印出指揮官 SOP 全文（給指揮官 AI 讀）'
     'version:顯示版本'
     'help:顯示說明'
   )
