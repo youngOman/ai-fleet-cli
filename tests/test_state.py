@@ -68,10 +68,10 @@ class ReportDirCase(unittest.TestCase):
         return path
 
     def plan(self, state, now=NOW, stable=STABLE, backfill=BACKFILL,
-             max_attempts=MAX_ATTEMPTS, ids=None):
+             max_attempts=MAX_ATTEMPTS, ids=None, cooldown=0):
         return fs.plan_reports(
             state, [self.dir], now, stable, backfill, max_attempts,
-            IDS if ids is None else ids,
+            IDS if ids is None else ids, cooldown,
         )
 
     @staticmethod
@@ -299,6 +299,96 @@ class TestContentHashDedup(ReportDirCase):
         self.assertEqual(entry["hash"], fs.file_md5(path))
         self.assertEqual(entry["notified_at"], NOW)
         self.assertEqual(entry["attempts"], 0)
+
+
+class TestNotifyCooldown(ReportDirCase):
+    """worker 交完報告後常會連續補寫幾次(補章節、補實際輸出、修 lint 格式)。
+
+    每次存檔內容都真的變了,舊版於是每次都通知——實測
+    20260806-1217-cc1-create-project-api.md 在 04:55:46 / 04:56:13 /
+    04:56:26 / 04:56:50 連送四則,指揮官被同一份報告洗版。
+    冷卻窗把這些補寫合併成一則。
+    """
+
+    COOLDOWN = 300
+
+    def _notified_once(self, name, body="第一版"):
+        path = self.write_report(name, body=body, mtime=NOW - 10)
+        state = fs.empty_state()
+        todo = self.plan(state, cooldown=self.COOLDOWN)
+        self.assertEqual(len(todo), 1)
+        fs.record_report(state, path, "ok", NOW, MAX_ATTEMPTS)
+        return state, path
+
+    def _rewrite(self, path, body, mtime):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.utime(path, (mtime, mtime))
+
+    def test_冷卻窗內連續補寫只通知一次(self):
+        name = "20260803-0130-cc1-修好登入.md"
+        state, path = self._notified_once(name)
+        # 首次通知後 27 秒內連改三次(重現實測的 04:55~04:56 那四則)
+        for i, offset in enumerate((13, 27, 40)):
+            self._rewrite(path, "補了第 %d 段" % i, NOW + offset)
+            self.assertEqual(
+                self.plan(state, now=NOW + offset + STABLE,
+                          cooldown=self.COOLDOWN), [],
+                "冷卻窗內第 %d 次補寫不該再通知" % (i + 1))
+
+    def test_冷卻窗過了會把最新版補送一則(self):
+        name = "20260803-0130-cc1-修好登入.md"
+        state, path = self._notified_once(name)
+        self._rewrite(path, "補了驗收證據", NOW + 30)
+        self.assertEqual(self.plan(state, now=NOW + 60,
+                                   cooldown=self.COOLDOWN), [])
+        todo = self.plan(state, now=NOW + self.COOLDOWN + 1,
+                         cooldown=self.COOLDOWN)
+        self.assertEqual(self.names(todo), [name])
+
+    def test_冷卻期間的修改不可被吃掉(self):
+        # 冷卻窗內**刻意不更新 hash**:更新了的話,窗過了就認為「內容沒變」,
+        # 那次補寫永久靜音——比洗版更糟,指揮官根本不知道報告改過。
+        name = "20260803-0130-cc1-修好登入.md"
+        state, path = self._notified_once(name)
+        before = state["reports"][name]["hash"]
+        self._rewrite(path, "冷卻期間補的內容", NOW + 30)
+        self.plan(state, now=NOW + 60, cooldown=self.COOLDOWN)
+        self.assertEqual(state["reports"][name]["hash"], before)
+
+    def test_冷卻窗內_mtime_仍要跟上(self):
+        name = "20260803-0130-cc1-修好登入.md"
+        state, path = self._notified_once(name)
+        self._rewrite(path, "補寫", NOW + 30)
+        self.plan(state, now=NOW + 60, cooldown=self.COOLDOWN)
+        self.assertEqual(state["reports"][name]["mtime"], NOW + 30)
+
+    def test_冷卻設為零就是舊行為(self):
+        # 關掉冷卻要能完全回到「內容變就通知」,否則沒有退路可退
+        name = "20260803-0130-cc1-修好登入.md"
+        state, path = self._notified_once(name)
+        self._rewrite(path, "第二版", NOW + 30)
+        self.assertEqual(
+            self.names(self.plan(state, now=NOW + 60, cooldown=0)), [name])
+
+    def test_沒通知過的報告不受冷卻影響(self):
+        # backfill 建的基準線 notified_at=0,不能被當成「剛通知過」而靜音
+        name = "20260803-0130-cc1-上週的.md"
+        path = self.write_report(name, body="舊", mtime=NOW - BACKFILL - 1)
+        state = fs.empty_state()
+        self.plan(state, cooldown=self.COOLDOWN)
+        self.assertEqual(state["reports"][name]["notified_at"], 0)
+        self._rewrite(path, "補了新的一節", NOW - 10)
+        self.assertEqual(
+            self.names(self.plan(state, cooldown=self.COOLDOWN)), [name])
+
+    def test_不同報告各自獨立冷卻(self):
+        # 冷卻是 per-report,不能因為 A 剛通知就把 B 的通知一起吃掉
+        state, _ = self._notified_once("20260803-0130-cc1-修好登入.md")
+        self.write_report("20260803-0131-cx1-另一份.md", body="乙",
+                          mtime=NOW + 10)
+        todo = self.plan(state, now=NOW + 20, cooldown=self.COOLDOWN)
+        self.assertEqual(self.names(todo), ["20260803-0131-cx1-另一份.md"])
 
 
 class TestUtf8KeyCollision(ReportDirCase):

@@ -108,6 +108,9 @@ fleet_init_paths() {
   : "${FLEET_QUIET_AFTER_REPORT:=300}"
   : "${FLEET_BACKFILL_SECS:=600}"
   : "${FLEET_MAX_ATTEMPTS:=3}"
+  # 同一份報告通知後的冷卻秒數。worker 交完常會連續補寫幾次,每次存檔都通知
+  # 會把指揮官洗版;窗內的修改合併成一則,窗過了再補送最新版。0 = 關閉。
+  : "${FLEET_REPORT_COOLDOWN_SECS:=300}"
   : "${FLEET_LINT_REPORTS:=1}"
 
   if ! printf '%s' "$FLEET_PROFILE" | grep -qE '^[A-Za-z0-9_-]+$'; then
@@ -127,6 +130,7 @@ fleet_init_paths() {
   export FLEET_SOCKET FLEET_SESSION FLEET_SEND_DELAY
   export FLEET_POLL_SECS FLEET_STABLE_SECS FLEET_IDLE_SECS FLEET_STUCK_SECS
   export FLEET_QUIET_AFTER_REPORT FLEET_BACKFILL_SECS FLEET_MAX_ATTEMPTS
+  export FLEET_REPORT_COOLDOWN_SECS
   export FLEET_LINT_REPORTS
   export FLEET_PROFILE_DIR FLEET_REG FLEET_COMMANDER_FILE FLEET_STATE_FILE
   export FLEET_LOG FLEET_PIDFILE FLEET_LOCKDIR
