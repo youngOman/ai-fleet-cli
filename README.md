@@ -284,6 +284,7 @@ fleet protocol       # 印出完整指揮官協定（= docs/commander-protocol.m
 | `FLEET_QUIET_AFTER_REPORT` | `300` | 剛交過報告後多久內不發閒置警報 |
 | `FLEET_BACKFILL_SECS` | `600` | 首次見到且超過這個秒數的舊報告只建基準線不通知 |
 | `FLEET_MAX_ATTEMPTS` | `3` | 送達驗證連續失敗幾次後熔斷 |
+| `FLEET_REPORT_COOLDOWN_SECS` | `300` | 同一份報告通知後多久內的補寫合併成一則（`0` 關閉） |
 | `FLEET_LINT_REPORTS` | `1` | 通知前是否對報告跑四節驗證（`0` 關閉） |
 
 **以上全部**都可以在 `config.env` 覆寫，也可以用真實環境變數覆寫。

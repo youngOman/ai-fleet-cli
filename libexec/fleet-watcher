@@ -78,6 +78,7 @@ check_reports() {
     --stable "$FLEET_STABLE_SECS" \
     --backfill "$FLEET_BACKFILL_SECS" \
     --max-attempts "$FLEET_MAX_ATTEMPTS" \
+    --cooldown "$FLEET_REPORT_COOLDOWN_SECS" \
     --ids "$ids" 2>/dev/null > "$FLEET_PROFILE_DIR/.plan.$$"
 
   while IFS=$'\t' read -r path tag worker topic; do
@@ -346,7 +347,7 @@ cmd_start() {
              FLEET_SOCKET FLEET_SESSION \
              FLEET_SEND_DELAY FLEET_POLL_SECS FLEET_STABLE_SECS FLEET_IDLE_SECS \
              FLEET_STUCK_SECS FLEET_QUIET_AFTER_REPORT FLEET_BACKFILL_SECS \
-             FLEET_MAX_ATTEMPTS FLEET_LINT_REPORTS; do
+             FLEET_MAX_ATTEMPTS FLEET_REPORT_COOLDOWN_SECS FLEET_LINT_REPORTS; do
       eval "[ -n \"\${$v+x}\" ]" || continue
       eval "val=\$$v"
       printf '%s=%s; export %s\n' "$v" "$(fleet_shq "$val")" "$v"
@@ -406,8 +407,9 @@ cmd_status() {
   else
     printf '  指揮官    %s未設定%s — 在指揮官那個 pane 跑 tmux display -p "#{pane_id}",再 fleet commander <pane>\n' "$c_ylw" "$c_rst"
   fi
-  printf '  門檻      輪詢=%ss 靜置=%ss 閒置=%ss 卡住=%ss 熔斷=%s 次\n' \
-    "$FLEET_POLL_SECS" "$FLEET_STABLE_SECS" "$FLEET_IDLE_SECS" "$FLEET_STUCK_SECS" "$FLEET_MAX_ATTEMPTS"
+  printf '  門檻      輪詢=%ss 靜置=%ss 閒置=%ss 卡住=%ss 熔斷=%s 次 報告冷卻=%ss\n' \
+    "$FLEET_POLL_SECS" "$FLEET_STABLE_SECS" "$FLEET_IDLE_SECS" "$FLEET_STUCK_SECS" \
+    "$FLEET_MAX_ATTEMPTS" "$FLEET_REPORT_COOLDOWN_SECS"
   printf '  狀態檔    %s\n' "$FLEET_STATE_FILE"
   printf '  日誌      %s\n' "$FLEET_LOG"
 }

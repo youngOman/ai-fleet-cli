@@ -145,10 +145,13 @@ def scan_dirs(dirs):
 # 決策:哪些報告該通知
 # ---------------------------------------------------------------------------
 
-def plan_reports(state, dirs, now, stable, backfill, max_attempts, ids):
+def plan_reports(state, dirs, now, stable, backfill, max_attempts, ids,
+                 cooldown=0):
     """回傳 [(path, tag, worker, topic)];會就地寫入 backfill 基準線。
 
     純函式(除了改 state dict),不碰檔案系統以外的東西,方便測試。
+
+    cooldown:同一份報告通知後的冷卻秒數,0 = 關閉。
     """
     todo = []
     for path, name, mtime in scan_dirs(dirs):
@@ -173,6 +176,18 @@ def plan_reports(state, dirs, now, stable, backfill, max_attempts, ids):
                 if mtime != entry.get("mtime"):
                     entry["mtime"] = mtime
                 continue
+            # 冷卻窗:worker 交完報告後常會連續補寫幾次(補章節、補實際輸出、
+            # 修 lint 抓到的格式)。每次存檔都通知的話,指揮官會在幾十秒內被
+            # 同一份報告洗版——實測 20260806-1217-cc1-create-project-api.md
+            # 在 04:55:46 / 04:56:13 / 04:56:26 / 04:56:50 連送四則。
+            #
+            # 通知過的報告在冷卻窗內先不吵。**刻意不更新 hash**,所以冷卻期間
+            # 的修改不會被吃掉,只是被合併——窗一過就把最新版補送一則。
+            notified_at = entry.get("notified_at", 0)
+            if cooldown > 0 and notified_at and now - notified_at < cooldown:
+                entry["mtime"] = mtime
+                continue
+
             if entry.get("attempts", 0) >= max_attempts \
                     and entry.get("attempt_mtime") == mtime:
                 # 熔斷:同一版連送 max_attempts 次都驗不到,放棄。
@@ -293,6 +308,7 @@ def main(argv=None):
     p.add_argument("--stable", type=int, default=3)
     p.add_argument("--backfill", type=int, default=600)
     p.add_argument("--max-attempts", type=int, default=3)
+    p.add_argument("--cooldown", type=int, default=0)
     p.add_argument("--ids", default="")
 
     p = sub.add_parser("record-report")
@@ -333,7 +349,8 @@ def main(argv=None):
 
     if args.cmd == "plan-reports":
         todo = plan_reports(state, args.dir, now, args.stable, args.backfill,
-                            args.max_attempts, split_ids(args.ids))
+                            args.max_attempts, split_ids(args.ids),
+                            args.cooldown)
         save_state(args.state, state)
         for path, tag, worker, topic in todo:
             sys.stdout.write("%s\t%s\t%s\t%s\n" % (path, tag, worker, topic))
